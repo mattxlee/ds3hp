@@ -787,6 +787,8 @@ static void cmd_reset(void)
 #define CHAIN_MAGIC "DS3CHAIN"
 #define CHAIN_VERSION 3
 #define CHAIN_MAX 8
+#define CHAIN_DEF_DEPTH 4
+#define CHAIN_DEF_OFF 0x1000
 #define CHAIN_MAX_OFF (1u << 20)
 #define CHAIN_MAX_PROBES 8000000u
 #define CHAIN_COUNT_MAX 1000000u
@@ -1284,100 +1286,551 @@ static void chain_scan(int pid, uint64_t T, int depth, uint64_t maxoff,
     free(m);
 }
 
-static int chainset_save(const char *file, const ChainSet *cs)
+/* ===================== minimal JSON ===================== */
+
+typedef enum { JNULL, JBOOL, JNUM, JSTR, JARR, JOBJ } JType;
+
+typedef struct JVal {
+    JType t;
+    int b;
+    long long num;
+    double dbl;
+    char *str;
+    struct JVal **items;
+    char **keys;
+    size_t n, cap;
+} JVal;
+
+static void json_free(JVal *v)
 {
-    FILE *f = fopen(file, "wb");
-    if (!f) {
-        fprintf(stderr, "error: open %s: %s\n", file, strerror(errno));
+    if (!v)
+        return;
+    if (v->t == JSTR)
+        free(v->str);
+    for (size_t i = 0; i < v->n; i++) {
+        if (v->t == JOBJ)
+            free(v->keys[i]);
+        json_free(v->items[i]);
+    }
+    free(v->keys);
+    free(v->items);
+    free(v);
+}
+
+typedef struct {
+    const char *p, *end;
+    int depth, err;
+} JParser;
+
+static JVal *jnew(JType t)
+{
+    JVal *v = calloc(1, sizeof *v);
+    if (v)
+        v->t = t;
+    return v;
+}
+
+static void jskip(JParser *j)
+{
+    while (j->p < j->end &&
+           (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r'))
+        j->p++;
+}
+
+static int jhex(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int jput(char **buf, size_t *len, size_t *cap, unsigned char c)
+{
+    if (*len + 1 >= *cap) {
+        size_t nc = *cap ? *cap * 2 : 32;
+        char *nb = realloc(*buf, nc);
+        if (!nb)
+            return 0;
+        *buf = nb;
+        *cap = nc;
+    }
+    (*buf)[(*len)++] = (char)c;
+    return 1;
+}
+
+static char *jstring(JParser *j)
+{
+    if (j->p >= j->end || *j->p != '"') {
+        j->err = 1;
+        return NULL;
+    }
+    j->p++;
+    char *s = NULL;
+    size_t len = 0, cap = 0;
+    while (j->p < j->end && *j->p != '"') {
+        unsigned char c = (unsigned char)*j->p++;
+        if (c == '\\') {
+            if (j->p >= j->end) { j->err = 1; break; }
+            char e = *j->p++;
+            switch (e) {
+            case '"': c = '"'; break;
+            case '\\': c = '\\'; break;
+            case '/': c = '/'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break;
+            case 'r': c = '\r'; break;
+            case 't': c = '\t'; break;
+            case 'u': {
+                unsigned cp = 0;
+                for (int k = 0; k < 4; k++) {
+                    if (j->p >= j->end || jhex(*j->p) < 0) { j->err = 1; break; }
+                    cp = cp * 16 + (unsigned)jhex(*j->p++);
+                }
+                if (cp < 0x80) {
+                    c = (unsigned char)cp;
+                } else if (cp < 0x800) {
+                    jput(&s, &len, &cap, (unsigned char)(0xC0 | (cp >> 6)));
+                    jput(&s, &len, &cap, (unsigned char)(0x80 | (cp & 0x3F)));
+                    continue;
+                } else {
+                    jput(&s, &len, &cap, (unsigned char)(0xE0 | (cp >> 12)));
+                    jput(&s, &len, &cap, (unsigned char)(0x80 | ((cp >> 6) & 0x3F)));
+                    jput(&s, &len, &cap, (unsigned char)(0x80 | (cp & 0x3F)));
+                    continue;
+                }
+                break;
+            }
+            default: j->err = 1; c = (unsigned char)e;
+            }
+        }
+        jput(&s, &len, &cap, c);
+    }
+    if (j->p >= j->end || *j->p != '"')
+        j->err = 1;
+    else
+        j->p++;
+    if (j->err || !jput(&s, &len, &cap, 0)) {
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+static int jpush(JVal *o, char *key, JVal *v)
+{
+    if (o->n == o->cap) {
+        size_t nc = o->cap ? o->cap * 2 : 8;
+        JVal **ni = realloc(o->items, nc * sizeof(JVal *));
+        if (!ni)
+            return 0;
+        o->items = ni;
+        if (o->t == JOBJ) {
+            char **nk = realloc(o->keys, nc * sizeof(char *));
+            if (!nk)
+                return 0;
+            o->keys = nk;
+        }
+        o->cap = nc;
+    }
+    if (o->t == JOBJ)
+        o->keys[o->n] = key;
+    o->items[o->n++] = v;
+    return 1;
+}
+
+static JVal *jvalue(JParser *j);
+
+static JVal *jarray(JParser *j)
+{
+    if (j->depth >= 32) { j->err = 1; return NULL; }
+    j->depth++;
+    JVal *a = jnew(JARR);
+    if (!a) { j->err = 1; j->depth--; return NULL; }
+    j->p++;
+    jskip(j);
+    if (j->p < j->end && *j->p == ']') { j->p++; j->depth--; return a; }
+    for (;;) {
+        JVal *v = jvalue(j);
+        if (!v || !jpush(a, NULL, v)) {
+            json_free(v);
+            json_free(a);
+            j->err = 1;
+            j->depth--;
+            return NULL;
+        }
+        jskip(j);
+        if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+        if (j->p < j->end && *j->p == ']') { j->p++; break; }
+        j->err = 1;
+        json_free(a);
+        j->depth--;
+        return NULL;
+    }
+    j->depth--;
+    return a;
+}
+
+static JVal *jobject(JParser *j)
+{
+    if (j->depth >= 32) { j->err = 1; return NULL; }
+    j->depth++;
+    JVal *o = jnew(JOBJ);
+    if (!o) { j->err = 1; j->depth--; return NULL; }
+    j->p++;
+    jskip(j);
+    if (j->p < j->end && *j->p == '}') { j->p++; j->depth--; return o; }
+    for (;;) {
+        jskip(j);
+        char *k = jstring(j);
+        if (!k) { json_free(o); j->depth--; return NULL; }
+        jskip(j);
+        if (j->p >= j->end || *j->p != ':') {
+            free(k);
+            json_free(o);
+            j->err = 1;
+            j->depth--;
+            return NULL;
+        }
+        j->p++;
+        JVal *v = jvalue(j);
+        if (!v || !jpush(o, k, v)) {
+            free(k);
+            json_free(v);
+            json_free(o);
+            j->err = 1;
+            j->depth--;
+            return NULL;
+        }
+        jskip(j);
+        if (j->p < j->end && *j->p == ',') { j->p++; continue; }
+        if (j->p < j->end && *j->p == '}') { j->p++; break; }
+        j->err = 1;
+        json_free(o);
+        j->depth--;
+        return NULL;
+    }
+    j->depth--;
+    return o;
+}
+
+static JVal *jvalue(JParser *j)
+{
+    jskip(j);
+    if (j->p >= j->end) { j->err = 1; return NULL; }
+    char c = *j->p;
+    if (c == '{') return jobject(j);
+    if (c == '[') return jarray(j);
+    if (c == '"') {
+        JVal *v = jnew(JSTR);
+        if (!v) { j->err = 1; return NULL; }
+        v->str = jstring(j);
+        if (!v->str) { json_free(v); return NULL; }
+        return v;
+    }
+    if (c == 't' && j->end - j->p >= 4 && !memcmp(j->p, "true", 4)) {
+        j->p += 4;
+        JVal *v = jnew(JBOOL);
+        if (v) v->b = 1;
+        return v;
+    }
+    if (c == 'f' && j->end - j->p >= 5 && !memcmp(j->p, "false", 5)) {
+        j->p += 5;
+        JVal *v = jnew(JBOOL);
+        return v;
+    }
+    if (c == 'n' && j->end - j->p >= 4 && !memcmp(j->p, "null", 4)) {
+        j->p += 4;
+        return jnew(JNULL);
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        char *e;
+        long long n = strtoll(j->p, &e, 10);
+        double d = (double)n;
+        if (e == j->p) { j->err = 1; return NULL; }
+        if (*e == '.' || *e == 'e' || *e == 'E') {
+            d = strtod(j->p, &e);
+            n = (long long)d;
+        }
+        j->p = e;
+        JVal *v = jnew(JNUM);
+        if (!v) { j->err = 1; return NULL; }
+        v->num = n;
+        v->dbl = d;
+        return v;
+    }
+    j->err = 1;
+    return NULL;
+}
+
+static JVal *json_parse(const char *text, size_t len)
+{
+    JParser j = { text, text + len, 0, 0 };
+    JVal *v = jvalue(&j);
+    if (!v)
+        return NULL;
+    jskip(&j);
+    if (j.err || j.p != j.end) {
+        json_free(v);
+        return NULL;
+    }
+    return v;
+}
+
+static JVal *jget(const JVal *o, const char *key)
+{
+    if (!o || o->t != JOBJ)
+        return NULL;
+    for (size_t i = 0; i < o->n; i++)
+        if (strcmp(o->keys[i], key) == 0)
+            return o->items[i];
+    return NULL;
+}
+
+static const char *jstr(const JVal *v) { return v && v->t == JSTR ? v->str : NULL; }
+static long long jll(const JVal *v, long long d) { return v && v->t == JNUM ? v->num : d; }
+static double jdbl(const JVal *v, double d) { return v && v->t == JNUM ? v->dbl : d; }
+static int jboolv(const JVal *v, int d) { return v && v->t == JBOOL ? v->b : d; }
+
+static void jw_str(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"': fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (c < 0x20) fprintf(f, "\\u%04x", c);
+            else fputc(c, f);
+        }
+    }
+    fputc('"', f);
+}
+
+/* ===================== watch store (JSON) ===================== */
+
+static const char *watches_path(void)
+{
+    static char path[512];
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0])
+        snprintf(path, sizeof path, "%s/ds3hp/watches.json", xdg);
+    else {
+        const char *home = getenv("HOME");
+        snprintf(path, sizeof path, "%s/.config/ds3hp/watches.json", home ? home : ".");
+    }
+    return path;
+}
+
+static void mkdir_p(const char *dir)
+{
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s", dir);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
+    }
+    mkdir(tmp, 0755);
+}
+
+typedef struct {
+    char name[24];
+    int type;
+    int has_lockval;
+    uint32_t lock_bits;
+    int lock_on;
+    int has_chain;
+    ChainSet cs;
+} WatchEntry;
+
+static void entries_free(WatchEntry *e, int n)
+{
+    if (!e)
+        return;
+    for (int i = 0; i < n; i++)
+        free(e[i].cs.c);
+    free(e);
+}
+
+static int entries_load(WatchEntry **out, int *outn)
+{
+    *out = NULL;
+    *outn = 0;
+    FILE *f = fopen(watches_path(), "rb");
+    if (!f)
+        return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || sz > (16 << 20)) {
+        fclose(f);
+        fprintf(stderr, "error: watches.json too large\n");
         return -1;
     }
-    uint32_t ver = CHAIN_VERSION;
-    uint32_t scans = cs->scans;
-    uint32_t verifies = cs->verifies;
-    int32_t type = cs->type;
-    uint64_t token = cs->token;
-    uint16_t ml = (uint16_t)strlen(cs->module);
-    uint32_t cnt = cs->n;
-    fwrite(CHAIN_MAGIC, 1, 8, f);
-    fwrite(&ver, 4, 1, f);
-    fwrite(&scans, 4, 1, f);
-    fwrite(&verifies, 4, 1, f);
-    fwrite(&type, 4, 1, f);
-    fwrite(&token, 8, 1, f);
-    fwrite(&ml, 2, 1, f);
-    if (ml)
-        fwrite(cs->module, 1, ml, f);
-    fwrite(&cnt, 4, 1, f);
-    for (uint32_t i = 0; i < cs->n; i++) {
-        fwrite(&cs->c[i].rva, 8, 1, f);
-        fwrite(&cs->c[i].n, 1, 1, f);
-        if (cs->c[i].n)
-            fwrite(cs->c[i].offs, 8, cs->c[i].n, f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return -1;
     }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = 0;
+    JVal *root = json_parse(buf, rd);
+    free(buf);
+    if (!root || root->t != JOBJ) {
+        json_free(root);
+        fprintf(stderr, "error: bad %s\n", watches_path());
+        return -1;
+    }
+    int cap = 0, n = 0;
+    WatchEntry *arr = NULL;
+    for (size_t i = 0; i < root->n; i++) {
+        const char *key = root->keys[i];
+        if (key[0] == '_')
+            continue;
+        JVal *w = root->items[i];
+        if (!w || w->t != JOBJ)
+            continue;
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 8;
+            WatchEntry *na = realloc(arr, (size_t)nc * sizeof *na);
+            if (!na) {
+                entries_free(arr, n);
+                json_free(root);
+                return -1;
+            }
+            arr = na;
+            cap = nc;
+        }
+        WatchEntry *e = &arr[n];
+        memset(e, 0, sizeof *e);
+        snprintf(e->name, sizeof e->name, "%s", key);
+        const char *ts = jstr(jget(w, "type"));
+        e->type = (ts && strcmp(ts, "int") == 0) ? T_INT : T_FLOAT;
+        JVal *lv = jget(w, "lock_value");
+        if (lv && lv->t == JNUM) {
+            e->has_lockval = 1;
+            e->lock_bits = val_to_bits(e->type, jdbl(lv, 0));
+        }
+        e->lock_on = jboolv(jget(w, "lock_on"), 0);
+        JVal *ch = jget(w, "chain");
+        if (ch && ch->t == JOBJ) {
+            ChainSet *cs = &e->cs;
+            cs->type = e->type;
+            const char *mod = jstr(jget(ch, "module"));
+            if (mod)
+                snprintf(cs->module, sizeof cs->module, "%s", mod);
+            cs->scans = (uint32_t)jll(jget(ch, "scans"), 0);
+            cs->verifies = (uint32_t)jll(jget(ch, "verifies"), 0);
+            cs->token = (uint64_t)jll(jget(ch, "token"), 0);
+            e->has_chain = 1;
+            JVal *list = jget(ch, "list");
+            if (list && list->t == JARR && list->n) {
+                cs->cap = list->n > CHAIN_COUNT_MAX ? CHAIN_COUNT_MAX : (uint32_t)list->n;
+                cs->c = calloc(cs->cap, sizeof(Chain));
+                if (!cs->c) {
+                    entries_free(arr, n + 1);
+                    json_free(root);
+                    return -1;
+                }
+                for (size_t k = 0; k < list->n && cs->n < cs->cap; k++) {
+                    JVal *item = list->items[k];
+                    if (!item || item->t != JOBJ)
+                        continue;
+                    Chain c;
+                    memset(&c, 0, sizeof c);
+                    c.rva = (uint64_t)jll(jget(item, "rva"), 0);
+                    JVal *offs = jget(item, "offs");
+                    if (offs && offs->t == JARR) {
+                        int nn = 0;
+                        for (size_t m = 0; m < offs->n && nn < CHAIN_MAX; m++)
+                            c.offs[nn++] = (uint64_t)jll(offs->items[m], 0);
+                        c.n = (uint8_t)nn;
+                    }
+                    cs->c[cs->n++] = c;
+                }
+            }
+        }
+        n++;
+    }
+    json_free(root);
+    *out = arr;
+    *outn = n;
+    return 0;
+}
+
+static int entries_save(const WatchEntry *e, int n)
+{
+    const char *path = watches_path();
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = 0; mkdir_p(dir); }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "error: open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "{\n  \"_version\": 1");
+    for (int i = 0; i < n; i++) {
+        const WatchEntry *w = &e[i];
+        fprintf(f, ",\n  ");
+        jw_str(f, w->name);
+        fprintf(f, ": {\n    \"type\": %s", w->type == T_INT ? "\"int\"" : "\"float\"");
+        if (w->has_lockval) {
+            if (w->type == T_INT)
+                fprintf(f, ",\n    \"lock_value\": %lld",
+                        (long long)(int32_t)w->lock_bits);
+            else
+                fprintf(f, ",\n    \"lock_value\": %.9g",
+                        bits_to_val(w->type, w->lock_bits));
+        }
+        fprintf(f, ",\n    \"lock_on\": %s", w->lock_on ? "true" : "false");
+        if (w->has_chain) {
+            fprintf(f, ",\n    \"chain\": {\n      \"module\": ");
+            jw_str(f, w->cs.module);
+            fprintf(f, ",\n      \"scans\": %u,\n      \"verifies\": %u,"
+                       "\n      \"token\": %llu,\n      \"list\": [",
+                    w->cs.scans, w->cs.verifies, (unsigned long long)w->cs.token);
+            for (uint32_t k = 0; k < w->cs.n; k++) {
+                fprintf(f, "%s\n        { \"rva\": %llu, \"offs\": [",
+                        k ? "," : "", (unsigned long long)w->cs.c[k].rva);
+                for (int m = 0; m < w->cs.c[k].n; m++)
+                    fprintf(f, "%s%llu", m ? ", " : "",
+                            (unsigned long long)w->cs.c[k].offs[m]);
+                fprintf(f, "] }");
+            }
+            fprintf(f, "\n      ]\n    }");
+        }
+        fprintf(f, "\n  }");
+    }
+    fprintf(f, "\n}\n");
     fclose(f);
     return 0;
 }
 
-static int chainset_load(const char *file, ChainSet *cs)
+static WatchEntry *entries_get(WatchEntry **arr, int *n, int *cap, const char *name)
 {
-    FILE *f = fopen(file, "rb");
-    if (!f)
-        return -1;
-    char magic[8];
-    uint32_t ver = 0, scans = 0, verifies = 0, cnt = 0;
-    int32_t type = 0;
-    uint64_t token = 0;
-    uint16_t ml = 0;
-    int ok = 1;
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, CHAIN_MAGIC, 8) != 0)
-        ok = 0;
-    if (ok && (fread(&ver, 4, 1, f) != 1 || ver != CHAIN_VERSION))
-        ok = 0;
-    if (ok && (fread(&scans, 4, 1, f) != 1 || fread(&verifies, 4, 1, f) != 1 ||
-               fread(&type, 4, 1, f) != 1 || fread(&token, 8, 1, f) != 1))
-        ok = 0;
-    if (ok && (fread(&ml, 2, 1, f) != 1 || ml >= sizeof cs->module))
-        ok = 0;
-    if (ok && ml && fread(cs->module, 1, ml, f) != ml)
-        ok = 0;
-    cs->module[ok ? ml : 0] = 0;
-    if (ok && (fread(&cnt, 4, 1, f) != 1 || cnt > CHAIN_COUNT_MAX))
-        ok = 0;
-    if (!ok) {
-        fclose(f);
-        fprintf(stderr, "error: bad chain file: %s\n", file);
-        return -2;
+    for (int i = 0; i < *n; i++)
+        if (strcmp((*arr)[i].name, name) == 0)
+            return &(*arr)[i];
+    if (*n == *cap) {
+        int nc = *cap ? *cap * 2 : 8;
+        WatchEntry *na = realloc(*arr, (size_t)nc * sizeof(WatchEntry));
+        if (!na)
+            return NULL;
+        *arr = na;
+        *cap = nc;
     }
-    Chain *arr = calloc(cnt ? cnt : 1, sizeof(Chain));
-    if (!arr) {
-        fclose(f);
-        fprintf(stderr, "error: malloc chain file\n");
-        return -2;
-    }
-    cs->c = arr;
-    cs->cap = cnt ? cnt : 1;
-    cs->n = 0;
-    cs->scans = scans;
-    cs->verifies = verifies;
-    cs->type = type;
-    cs->token = token;
-    for (uint32_t i = 0; i < cnt; i++) {
-        uint8_t n;
-        if (fread(&arr[i].rva, 8, 1, f) != 1 || fread(&n, 1, 1, f) != 1 ||
-            n > CHAIN_MAX || (n && fread(arr[i].offs, 8, n, f) != n)) {
-            fclose(f);
-            free(arr);
-            cs->c = NULL;
-            cs->n = 0;
-            cs->cap = 0;
-            fprintf(stderr, "error: bad chain file: %s\n", file);
-            return -2;
-        }
-        arr[i].n = n;
-        cs->n++;
-    }
-    fclose(f);
-    return 0;
+    WatchEntry *e = &(*arr)[(*n)++];
+    memset(e, 0, sizeof *e);
+    snprintf(e->name, sizeof e->name, "%s", name);
+    e->type = T_FLOAT;
+    return e;
 }
 
 static int cs_contains(const ChainSet *cs, const Chain *c)
@@ -1413,13 +1866,40 @@ static int chainset_intersect(ChainSet *a, ChainSet *b, ChainSet *out)
     return 0;
 }
 
+static WatchEntry *chain_get_entry(const char *name, WatchEntry **arr, int *n, int *cap)
+{
+    if (entries_load(arr, n) != 0)
+        exit(1);
+    *cap = *n;
+    WatchEntry *e = entries_get(arr, n, cap, name);
+    if (!e) {
+        fprintf(stderr, "error: out of memory\n");
+        exit(1);
+    }
+    return e;
+}
+
+static void chain_status(const WatchEntry *e, char *buf, size_t len)
+{
+    if (!e->has_chain) {
+        snprintf(buf, len, "no chain");
+    } else if (chain_is_stable(&e->cs)) {
+        snprintf(buf, len, "stable (%u chain, %u scan, %u verify)",
+                 e->cs.n, e->cs.scans, e->cs.verifies);
+    } else {
+        snprintf(buf, len, "%u candidate(s), %u scan, %u verify",
+                 e->cs.n, e->cs.scans, e->cs.verifies);
+    }
+}
+
 static int cmd_chain_scan(int argc, char **argv)
 {
-    const char *file = NULL;
+    const char *name = NULL;
     const char *mod = "DarkSoulsIII.exe";
     uint64_t addr = 0;
-    int have_addr = 0, depth = 4, pid = 0, reset = 0, type = T_FLOAT;
-    uint64_t maxoff = 0x1000;
+    int have_addr = 0, depth = CHAIN_DEF_DEPTH, pid = 0, reset = 0;
+    int type = -1;
+    uint64_t maxoff = CHAIN_DEF_OFF;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--addr") == 0 && i + 1 < argc) {
             addr = strtoull(argv[++i], NULL, 0);
@@ -1433,19 +1913,20 @@ static int cmd_chain_scan(int argc, char **argv)
         } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             pid = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
-            const char *t = argv[++i];
-            type = strcmp(t, "int") == 0 ? T_INT : T_FLOAT;
+            type = strcmp(argv[++i], "int") == 0 ? T_INT : T_FLOAT;
         } else if (strcmp(argv[i], "--reset") == 0) {
             reset = 1;
-        } else if (!file) {
-            file = argv[i];
+        } else if (!name) {
+            name = argv[i];
         } else {
             fprintf(stderr, "error: unknown option %s\n", argv[i]);
             return 1;
         }
     }
-    if (!file || !have_addr) {
-        fprintf(stderr, "error: chain scan <file> --addr 0xADDR [--depth N] [--max-offset M] [--module S] [--pid P] [--type float|int] [--reset]\n");
+    if (!name || !have_addr) {
+        fprintf(stderr, "error: chain scan <watch> --addr 0xADDR"
+                        " [--depth N] [--max-offset M] [--module S]"
+                        " [--pid P] [--type float|int] [--reset]\n");
         return 1;
     }
     if (depth < 1 || depth > CHAIN_MAX)
@@ -1476,22 +1957,19 @@ static int cmd_chain_scan(int argc, char **argv)
     }
     free(m);
 
-    ChainSet prev;
-    int have_prev = 0;
-    if (!reset) {
-        int r = chainset_load(file, &prev);
-        if (r == 0)
-            have_prev = 1;
-        else if (r == -2)
-            return 1;
-    }
+    WatchEntry *arr = NULL;
+    int n = 0, cap = 0;
+    WatchEntry *e = chain_get_entry(name, &arr, &n, &cap);
+    if (type >= 0)
+        e->type = type;
 
     ChainSet fresh = {0};
-    fresh.type = type;
+    fresh.type = e->type;
     snprintf(fresh.module, sizeof fresh.module, "%s", mod);
-    fprintf(stderr, "pointer scan: target 0x%llx, module %s (base 0x%llx), depth %d, max-offset 0x%llx\n",
-            (unsigned long long)addr, mod, (unsigned long long)modbase, depth,
-            (unsigned long long)maxoff);
+    fprintf(stderr, "scan '%s': target 0x%llx, module %s (base 0x%llx),"
+                    " depth %d, max-offset 0x%llx\n",
+            name, (unsigned long long)addr, mod, (unsigned long long)modbase,
+            depth, (unsigned long long)maxoff);
     uint64_t total = 0;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1500,103 +1978,127 @@ static int cmd_chain_scan(int argc, char **argv)
     double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
     printf("scan: %u candidate chain(s) in %.1fs\n", fresh.n, dt);
 
-    ChainSet result = {0};
     uint64_t tok = process_token(g_pid);
-    if (have_prev && prev.token != 0 && prev.token == tok) {
-        fprintf(stderr, "note: same process as last scan (pid %d); restart the game before scanning again\n", g_pid);
-        result = prev;
+    int have_prev = e->has_chain && e->cs.n > 0 && !reset;
+    uint32_t prevn = have_prev ? e->cs.n : 0;
+    int same = have_prev && e->cs.token != 0 && e->cs.token == tok;
+    if (same) {
+        fprintf(stderr, "note: same process as last scan (pid %d); restart the game"
+                        " before scanning again\n", g_pid);
     } else if (have_prev) {
-        chainset_intersect(&prev, &fresh, &result);
+        ChainSet result = {0};
+        chainset_intersect(&e->cs, &fresh, &result);
         result.token = tok;
-        printf("intersect: %u -> %u chain(s) (scan #%u)\n", prev.n, result.n, result.scans);
-        free(prev.c);
+        free(e->cs.c);
+        e->cs = result;
+        printf("intersect: %u -> %u chain(s) (scan #%u)\n", prevn, e->cs.n, e->cs.scans);
     } else {
-        result = fresh;
-        result.type = type;
+        ChainSet result = fresh;
+        memset(&fresh, 0, sizeof fresh);
+        result.type = e->type;
         snprintf(result.module, sizeof result.module, "%s", mod);
         result.scans = 1;
         result.token = tok;
-        memset(&fresh, 0, sizeof fresh);
-        printf("saved %u candidate chain(s) (scan #1)\n", result.n);
-        if (result.n == 0)
-            fprintf(stderr, "note: no chain found; increase --depth/--max-offset\n");
+        free(e->cs.c);
+        e->cs = result;
+        printf("saved %u candidate chain(s) (scan #1)\n", e->cs.n);
     }
-    if (chainset_save(file, &result) != 0) {
-        free(result.c);
+    free(fresh.c);
+    e->has_chain = 1;
+    if (entries_save(arr, n) != 0) {
+        entries_free(arr, n);
         return 1;
     }
-    printf("wrote %s (%u chain(s), %u scan(s), %u verify/ies)\n", file, result.n,
-           result.scans, result.verifies);
-    if (chain_is_stable(&result)) {
+    printf("wrote %s (%u chain(s), %u scan(s), %u verify/ies)\n", watches_path(),
+           e->cs.n, e->cs.scans, e->cs.verifies);
+    if (chain_is_stable(&e->cs)) {
         char b[512];
-        chain_format(&result.c[0], result.module, b, sizeof b);
+        chain_format(&e->cs.c[0], e->cs.module, b, sizeof b);
         printf("stable chain: %s\n", b);
-        printf("use: ds3hp chain load %s\n", file);
-    } else if (result.n > 1) {
+        printf("use: ds3hp chain load %s\n", name);
+    } else if (e->cs.n > 1) {
         printf("still %u candidate(s); re-run after a restart, or use"
-               " 'chain verify <file> --value V'\n", result.n);
+               " 'chain verify %s --value V'\n", e->cs.n, name);
     }
-    free(result.c);
-    free(fresh.c);
+    entries_free(arr, n);
     return 0;
-}
-
-static ChainSet chain_load_file(const char *file)
-{
-    ChainSet cs = {0};
-    int r = chainset_load(file, &cs);
-    if (r == -1) {
-        fprintf(stderr, "error: no chain file %s; run 'chain scan' first\n", file);
-        exit(1);
-    }
-    if (r != 0)
-        exit(1);
-    return cs;
 }
 
 static void cmd_chain_list(int argc, char **argv)
 {
-    const char *file = NULL;
+    const char *name = NULL;
     int pid = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
             pid = atoi(argv[++i]);
-        else if (!file)
-            file = argv[i];
+        else if (!name)
+            name = argv[i];
         else {
             fprintf(stderr, "error: unknown option %s\n", argv[i]);
             exit(1);
         }
     }
-    if (!file) {
-        fprintf(stderr, "error: chain list <file> [--pid P]\n");
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0)
+        exit(1);
+    printf("%s\n", watches_path());
+    if (!name) {
+        if (n == 0)
+            printf("  (no watches)\n");
+        for (int i = 0; i < n; i++) {
+            char s[128], lk[32];
+            chain_status(&arr[i], s, sizeof s);
+            if (arr[i].has_lockval)
+                snprintf(lk, sizeof lk, "%g", bits_to_val(arr[i].type, arr[i].lock_bits));
+            else
+                snprintf(lk, sizeof lk, "-");
+            printf("  %-16s %-5s lock=%-10s%s chain: %s\n", arr[i].name,
+                   arr[i].type == T_INT ? "int" : "float", lk,
+                   arr[i].lock_on ? " [on]" : "", s);
+        }
+        entries_free(arr, n);
+        return;
+    }
+    WatchEntry *e = NULL;
+    for (int i = 0; i < n; i++)
+        if (strcmp(arr[i].name, name) == 0)
+            e = &arr[i];
+    if (!e) {
+        fprintf(stderr, "error: no watch '%s'\n", name);
+        entries_free(arr, n);
         exit(1);
     }
-    ChainSet cs = chain_load_file(file);
-    printf("%s: %u chain(s), %u scan(s), %u verify/ies, module %s, type %s\n", file,
-           cs.n, cs.scans, cs.verifies, cs.module,
-           cs.type == T_FLOAT ? "float" : "int");
+    if (!e->has_chain) {
+        printf("watch '%s' has no chain\n", name);
+        entries_free(arr, n);
+        return;
+    }
+    printf("watch '%s': %u chain(s), %u scan(s), %u verify/ies, module %s, type %s\n",
+           name, e->cs.n, e->cs.scans, e->cs.verifies, e->cs.module,
+           e->cs.type == T_INT ? "int" : "float");
     CMap *m = NULL;
     size_t nm = 0;
     uint64_t modbase = 0;
     if (pid) {
         g_pid = pid;
         if (cmaps_read(pid, &m, &nm) == 0)
-            modbase = chain_module_base(m, nm, cs.module);
+            modbase = chain_module_base(m, nm, e->cs.module);
     }
-    for (uint32_t i = 0; i < cs.n; i++) {
+    for (uint32_t i = 0; i < e->cs.n; i++) {
         char b[512];
-        chain_format(&cs.c[i], cs.module, b, sizeof b);
-        printf("  [%u] %s  (%u deref%s, total 0x%llx)", i, b, cs.c[i].n,
-               cs.c[i].n == 1 ? "" : "s", (unsigned long long)chain_total_off(&cs.c[i]));
+        chain_format(&e->cs.c[i], e->cs.module, b, sizeof b);
+        printf("  [%u] %s  (%u deref%s, total 0x%llx)", i, b, e->cs.c[i].n,
+               e->cs.c[i].n == 1 ? "" : "s",
+               (unsigned long long)chain_total_off(&e->cs.c[i]));
         if (pid) {
             uint64_t addr;
-            if (modbase && chain_resolve(pid, m, nm, modbase, &cs.c[i], &addr)) {
+            if (modbase && chain_resolve(pid, m, nm, modbase, &e->cs.c[i], &addr)) {
                 int ok;
                 uint32_t v = read_at(addr, &ok);
                 if (ok)
                     printf("  @0x%llx = %g", (unsigned long long)addr,
-                           bits_to_val(cs.type, v));
+                           bits_to_val(e->cs.type, v));
                 else
                     printf("  @0x%llx = <unreadable>", (unsigned long long)addr);
             } else {
@@ -1606,12 +2108,12 @@ static void cmd_chain_list(int argc, char **argv)
         printf("\n");
     }
     free(m);
-    free(cs.c);
+    entries_free(arr, n);
 }
 
 static void cmd_chain_resolve(int argc, char **argv)
 {
-    const char *file = NULL;
+    const char *name = NULL;
     int index = 0, pid = 0, have_val = 0;
     double val = 0;
     for (int i = 0; i < argc; i++) {
@@ -1622,74 +2124,167 @@ static void cmd_chain_resolve(int argc, char **argv)
         else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
             val = atof(argv[++i]);
             have_val = 1;
-        } else if (!file)
-            file = argv[i];
+        } else if (!name)
+            name = argv[i];
         else {
             fprintf(stderr, "error: unknown option %s\n", argv[i]);
             exit(1);
         }
     }
-    if (!file) {
-        fprintf(stderr, "error: chain resolve <file> [--index K] [--pid P] [--value V]\n");
+    if (!name) {
+        fprintf(stderr, "error: chain resolve <watch> [--index K] [--pid P] [--value V]\n");
         exit(1);
     }
-    ChainSet cs = chain_load_file(file);
-    if (cs.scans < 2)
-        fprintf(stderr, "warning: only %u scan(s); chain not yet verified across restarts\n", cs.scans);
-    if (index < 0 || (uint32_t)index >= cs.n) {
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0)
+        exit(1);
+    WatchEntry *e = NULL;
+    for (int i = 0; i < n; i++)
+        if (strcmp(arr[i].name, name) == 0)
+            e = &arr[i];
+    if (!e || !e->has_chain) {
+        fprintf(stderr, "error: no chain for watch '%s'\n", name);
+        entries_free(arr, n);
+        exit(1);
+    }
+    ChainSet *cs = &e->cs;
+    if (cs->scans < 2 && cs->verifies < 1)
+        fprintf(stderr, "warning: chain not yet verified across restarts\n");
+    if (index < 0 || (uint32_t)index >= cs->n) {
         fprintf(stderr, "error: index %d out of range (0..%d)\n", index,
-                cs.n ? (int)cs.n - 1 : 0);
+                cs->n ? (int)cs->n - 1 : 0);
+        entries_free(arr, n);
         exit(1);
     }
     g_pid = pid ? pid : detect_pid();
     if (!g_pid) {
         fprintf(stderr, "error: Dark Souls III process not found\n");
+        entries_free(arr, n);
         exit(1);
     }
     CMap *m = NULL;
     size_t nm = 0;
     if (cmaps_read(g_pid, &m, &nm) != 0) {
         fprintf(stderr, "error: open maps\n");
+        entries_free(arr, n);
         exit(1);
     }
-    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    uint64_t modbase = chain_module_base(m, nm, cs->module);
     if (!modbase) {
-        const char *base = strrchr(cs.module, '/');
-        base = base ? base + 1 : cs.module;
+        const char *base = strrchr(cs->module, '/');
+        base = base ? base + 1 : cs->module;
         modbase = chain_module_base(m, nm, base);
     }
-    if (!modbase) {
-        fprintf(stderr, "error: module '%s' not mapped now\n", cs.module);
-        exit(1);
-    }
     uint64_t addr;
-    if (!chain_resolve(g_pid, m, nm, modbase, &cs.c[index], &addr)) {
-        fprintf(stderr, "error: chain %d failed to resolve\n", index);
+    if (!modbase || !chain_resolve(g_pid, m, nm, modbase, &cs->c[index], &addr)) {
+        fprintf(stderr, "error: chain %d failed to resolve (module %s)\n",
+                index, cs->module);
+        free(m);
+        entries_free(arr, n);
         exit(1);
     }
     char b[512];
-    chain_format(&cs.c[index], cs.module, b, sizeof b);
+    chain_format(&cs->c[index], cs->module, b, sizeof b);
     printf("%s\n  resolves to 0x%llx (pid %d, module base 0x%llx)\n", b,
            (unsigned long long)addr, g_pid, (unsigned long long)modbase);
     if (have_val) {
         int ok;
         uint32_t v = read_at(addr, &ok);
-        uint32_t want = val_to_bits(cs.type, val);
+        uint32_t want = val_to_bits(cs->type, val);
         if (!ok)
             printf("  warning: value unreadable at address\n");
         else if (v != want)
             printf("  warning: value %g != expected %g (address may be wrong)\n",
-                   bits_to_val(cs.type, v), val);
+                   bits_to_val(cs->type, v), val);
         else
             printf("  value check ok: %g\n", val);
     }
     free(m);
-    free(cs.c);
+    entries_free(arr, n);
+}
+
+static void cmd_chain_verify(int argc, char **argv)
+{
+    const char *name = NULL;
+    int pid = 0, have_val = 0;
+    double val = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
+            val = atof(argv[++i]);
+            have_val = 1;
+        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+            pid = atoi(argv[++i]);
+        } else if (!name)
+            name = argv[i];
+        else {
+            fprintf(stderr, "error: unknown option %s\n", argv[i]);
+            exit(1);
+        }
+    }
+    if (!name || !have_val) {
+        fprintf(stderr, "error: chain verify <watch> --value V [--pid P]\n");
+        exit(1);
+    }
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0)
+        exit(1);
+    WatchEntry *e = NULL;
+    for (int i = 0; i < n; i++)
+        if (strcmp(arr[i].name, name) == 0)
+            e = &arr[i];
+    if (!e || !e->has_chain || e->cs.n == 0) {
+        fprintf(stderr, "error: no chain for watch '%s'\n", name);
+        entries_free(arr, n);
+        exit(1);
+    }
+    g_pid = pid ? pid : detect_pid();
+    if (!g_pid) {
+        fprintf(stderr, "error: Dark Souls III process not found\n");
+        entries_free(arr, n);
+        exit(1);
+    }
+    uint64_t tok = process_token(g_pid);
+    int same = e->cs.token != 0 && e->cs.token == tok;
+    uint32_t before = e->cs.n;
+    int r = chain_verify(&e->cs, g_pid, val);
+    if (r < 0) {
+        entries_free(arr, n);
+        exit(1);
+    }
+    if (!same) {
+        e->cs.verifies++;
+        e->cs.token = tok;
+    }
+    if (e->cs.n == 0) {
+        fprintf(stderr, "no chain matched %g; %u candidate(s) kept (not saved)\n",
+                val, before);
+        entries_free(arr, n);
+        return;
+    }
+    if (entries_save(arr, n) != 0) {
+        entries_free(arr, n);
+        exit(1);
+    }
+    printf("verify '%s': %u -> %u chain(s) against %g (%u verify/ies)%s\n", name,
+           before, e->cs.n, val, e->cs.verifies,
+           same ? " [same process, not counted]" : "");
+    if (!same && chain_is_stable(&e->cs)) {
+        char b[512];
+        chain_format(&e->cs.c[0], e->cs.module, b, sizeof b);
+        printf("stable chain: %s\n", b);
+        printf("use: ds3hp chain load %s\n", name);
+    } else {
+        printf("still %u candidate(s); repeat after a restart with another value\n",
+               e->cs.n);
+    }
+    entries_free(arr, n);
 }
 
 static void cmd_chain_load(int argc, char **argv)
 {
-    const char *file = NULL;
+    const char *name = NULL;
     int index = 0, pid = 0, have_val = 0;
     double val = 0;
     for (int i = 0; i < argc; i++) {
@@ -1700,40 +2295,59 @@ static void cmd_chain_load(int argc, char **argv)
         else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
             val = atof(argv[++i]);
             have_val = 1;
-        } else if (!file)
-            file = argv[i];
+        } else if (!name)
+            name = argv[i];
         else {
             fprintf(stderr, "error: unknown option %s\n", argv[i]);
             exit(1);
         }
     }
-    if (!file) {
-        fprintf(stderr, "error: chain load <file> [--index K] [--pid P] [--value V]\n");
+    if (!name) {
+        fprintf(stderr, "error: chain load <watch> [--index K] [--pid P] [--value V]\n");
         exit(1);
     }
-    ChainSet cs = chain_load_file(file);
-    if (cs.scans < 2)
-        fprintf(stderr, "warning: only %u scan(s); chain not yet verified across restarts\n", cs.scans);
-    if (index < 0 || (uint32_t)index >= cs.n) {
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0)
+        exit(1);
+    WatchEntry *e = NULL;
+    for (int i = 0; i < n; i++)
+        if (strcmp(arr[i].name, name) == 0)
+            e = &arr[i];
+    if (!e || !e->has_chain) {
+        fprintf(stderr, "error: no chain for watch '%s'\n", name);
+        entries_free(arr, n);
+        exit(1);
+    }
+    ChainSet *cs = &e->cs;
+    if (cs->scans < 2 && cs->verifies < 1)
+        fprintf(stderr, "warning: chain not yet verified across restarts\n");
+    if (index < 0 || (uint32_t)index >= cs->n) {
         fprintf(stderr, "error: index %d out of range (0..%d)\n", index,
-                cs.n ? (int)cs.n - 1 : 0);
+                cs->n ? (int)cs->n - 1 : 0);
+        entries_free(arr, n);
         exit(1);
     }
     g_pid = pid ? pid : detect_pid();
     if (!g_pid) {
         fprintf(stderr, "error: Dark Souls III process not found\n");
+        entries_free(arr, n);
         exit(1);
     }
     CMap *m = NULL;
     size_t nm = 0;
     if (cmaps_read(g_pid, &m, &nm) != 0) {
         fprintf(stderr, "error: open maps\n");
+        entries_free(arr, n);
         exit(1);
     }
-    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    uint64_t modbase = chain_module_base(m, nm, cs->module);
     uint64_t addr;
-    if (!modbase || !chain_resolve(g_pid, m, nm, modbase, &cs.c[index], &addr)) {
-        fprintf(stderr, "error: chain %d failed to resolve (module %s)\n", index, cs.module);
+    if (!modbase || !chain_resolve(g_pid, m, nm, modbase, &cs->c[index], &addr)) {
+        fprintf(stderr, "error: chain %d failed to resolve (module %s)\n",
+                index, cs->module);
+        free(m);
+        entries_free(arr, n);
         exit(1);
     }
     int ok;
@@ -1741,15 +2355,17 @@ static void cmd_chain_load(int argc, char **argv)
     if (!ok) {
         fprintf(stderr, "error: resolved address 0x%llx is unreadable\n",
                 (unsigned long long)addr);
+        free(m);
+        entries_free(arr, n);
         exit(1);
     }
     if (have_val) {
-        uint32_t want = val_to_bits(cs.type, val);
+        uint32_t want = val_to_bits(cs->type, val);
         if (cur != want)
             printf("warning: current value %g != expected %g\n",
-                   bits_to_val(cs.type, cur), val);
+                   bits_to_val(cs->type, cur), val);
     }
-    g_s.type = cs.type;
+    g_s.type = cs->type;
     g_s.min = 1.0;
     g_s.max = 10000.0;
     g_s.exact = 0;
@@ -1762,92 +2378,74 @@ static void cmd_chain_load(int argc, char **argv)
     g_s.c = NULL;
     g_s.n = 0;
     g_s.cap = 0;
-    printf("loaded chain %d -> 0x%llx = %g (pid %d)\n", index,
-           (unsigned long long)addr, bits_to_val(cs.type, cur), g_pid);
+    printf("loaded '%s' chain %d -> 0x%llx = %g (pid %d)\n", name, index,
+           (unsigned long long)addr, bits_to_val(cs->type, cur), g_pid);
     printf("run 'ds3hp list' or 'ds3hp lock 0' to use it\n");
     free(m);
-    free(cs.c);
+    entries_free(arr, n);
 }
 
-static void cmd_chain_verify(int argc, char **argv)
+static void chain_remove(const char *name, int rm)
 {
-    const char *file = NULL;
-    int pid = 0, have_val = 0;
-    double val = 0;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
-            val = atof(argv[++i]);
-            have_val = 1;
-        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
-            pid = atoi(argv[++i]);
-        } else if (!file) {
-            file = argv[i];
-        } else {
-            fprintf(stderr, "error: unknown option %s\n", argv[i]);
-            exit(1);
-        }
-    }
-    if (!file || !have_val) {
-        fprintf(stderr, "error: chain verify <file> --value V [--pid P]\n");
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0)
         exit(1);
-    }
-    ChainSet cs = chain_load_file(file);
-    g_pid = pid ? pid : detect_pid();
-    if (!g_pid) {
-        fprintf(stderr, "error: Dark Souls III process not found\n");
-        exit(1);
-    }
-    uint64_t tok = process_token(g_pid);
-    int same = cs.token != 0 && cs.token == tok;
-    uint32_t before = cs.n;
-    int r = chain_verify(&cs, g_pid, val);
-    if (r < 0) {
-        free(cs.c);
-        exit(1);
-    }
-    if (!same) {
-        cs.verifies++;
-        cs.token = tok;
-    }
-    if (cs.n == 0) {
-        fprintf(stderr, "no chain matched %g; %u candidate(s) kept (not saved)\n",
-                val, before);
-        free(cs.c);
+    int idx = -1;
+    for (int i = 0; i < n; i++)
+        if (strcmp(arr[i].name, name) == 0)
+            idx = i;
+    if (idx < 0) {
+        printf("nothing to remove ('%s')\n", name);
+        entries_free(arr, n);
         return;
     }
-    if (chainset_save(file, &cs) != 0) {
-        free(cs.c);
-        exit(1);
-    }
-    printf("verify: %u -> %u chain(s) against %g (%u verify/ies)%s\n", before, cs.n,
-           val, cs.verifies, same ? " [same process, not counted]" : "");
-    if (!same && chain_is_stable(&cs)) {
-        char b[512];
-        chain_format(&cs.c[0], cs.module, b, sizeof b);
-        printf("stable chain: %s\n", b);
-        printf("use: ds3hp chain load %s\n", file);
+    if (rm) {
+        free(arr[idx].cs.c);
+        memmove(&arr[idx], &arr[idx + 1], (size_t)(n - idx - 1) * sizeof(WatchEntry));
+        n--;
+        printf("removed watch '%s'\n", name);
     } else {
-        printf("still %u candidate(s); repeat after a restart with another value\n", cs.n);
+        free(arr[idx].cs.c);
+        memset(&arr[idx].cs, 0, sizeof arr[idx].cs);
+        arr[idx].cs.type = arr[idx].type;
+        arr[idx].has_chain = 0;
+        printf("cleared chain for '%s'\n", name);
     }
-    free(cs.c);
+    entries_save(arr, n);
+    entries_free(arr, n);
 }
 
 static void cmd_chain_clear(int argc, char **argv)
 {
     if (argc < 1) {
-        fprintf(stderr, "error: chain clear <file>\n");
+        fprintf(stderr, "error: chain clear <watch>\n");
         exit(1);
     }
-    if (unlink(argv[0]) == 0)
-        printf("removed %s\n", argv[0]);
-    else
-        printf("nothing to remove (%s)\n", argv[0]);
+    chain_remove(argv[0], 0);
+}
+
+static void cmd_chain_rm(int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "error: chain rm <watch>\n");
+        exit(1);
+    }
+    chain_remove(argv[0], 1);
 }
 
 static void cmd_chain(int argc, char **argv)
 {
     if (argc < 1) {
-        fprintf(stderr, "usage: chain <scan|list|resolve|load|clear> ...\n");
+        fprintf(stderr,
+                "usage: chain <scan|list|resolve|verify|load|clear|rm> ...\n"
+                "  scan    <watch> --addr 0xADDR [--type float|int] ...\n"
+                "  list    [<watch>] [--pid P]\n"
+                "  resolve <watch> [--index K] [--value V] [--pid P]\n"
+                "  verify  <watch> --value V [--pid P]\n"
+                "  load    <watch> [--index K] [--value V] [--pid P]\n"
+                "  clear   <watch>      remove the watch's chain\n"
+                "  rm      <watch>      remove the watch entirely\n");
         exit(1);
     }
     const char *sub = argv[0];
@@ -1863,6 +2461,8 @@ static void cmd_chain(int argc, char **argv)
         cmd_chain_load(argc - 1, argv + 1);
     else if (strcmp(sub, "clear") == 0)
         cmd_chain_clear(argc - 1, argv + 1);
+    else if (strcmp(sub, "rm") == 0)
+        cmd_chain_rm(argc - 1, argv + 1);
     else {
         fprintf(stderr, "error: unknown chain subcommand '%s'\n", sub);
         exit(1);
@@ -1875,8 +2475,6 @@ static void cmd_chain(int argc, char **argv)
 #define TICK_MS 20
 #define SCAN_FIRST (-1)
 #define SCAN_CHAIN (-2)
-#define CHAIN_DEF_DEPTH 4
-#define CHAIN_DEF_OFF 0x1000
 
 typedef struct {
     char name[24];
@@ -1896,8 +2494,6 @@ typedef struct {
     char status[80];
     int live_ok;
     uint32_t live_bits;
-    char chain_file[256];
-    int has_chain_file;
     ChainSet cs;
     int has_cs;
 } Watch;
@@ -1928,6 +2524,8 @@ static void set_notice(const char *s)
     g_notice_until = now_ms() + 4000;
 }
 
+static int watches_save(void);
+
 static void *scan_thread(void *p)
 {
     ScanArgs *a = p;
@@ -1949,22 +2547,20 @@ static void *scan_thread(void *p)
         chain_scan(g_pid, w->addr, CHAIN_DEF_DEPTH, CHAIN_DEF_OFF, "DarkSoulsIII.exe",
                    &fresh, &w->cancel, &w->progress, &total);
         w->total = total;
-        ChainSet result = {0};
-        ChainSet prev;
         uint64_t tok = process_token(g_pid);
         int same_proc = 0;
-        if (w->has_chain_file && access(w->chain_file, F_OK) == 0 &&
-            chainset_load(w->chain_file, &prev) == 0) {
-            if (prev.token != 0 && prev.token == tok) {
+        ChainSet result = {0};
+        if (w->has_cs && w->cs.n > 0) {
+            if (w->cs.token != 0 && w->cs.token == tok) {
                 same_proc = 1;
-                result = prev;
             } else {
-                chainset_intersect(&prev, &fresh, &result);
+                chainset_intersect(&w->cs, &fresh, &result);
                 result.token = tok;
-                free(prev.c);
+                free(w->cs.c);
+                w->cs = result;
+                free(fresh.c);
+                fresh.c = NULL;
             }
-            free(fresh.c);
-            fresh.c = NULL;
         } else {
             result = fresh;
             memset(&fresh, 0, sizeof fresh);
@@ -1972,20 +2568,18 @@ static void *scan_thread(void *p)
             snprintf(result.module, sizeof result.module, "%s", "DarkSoulsIII.exe");
             result.scans = 1;
             result.token = tok;
+            free(w->cs.c);
+            w->cs = result;
         }
-        int save_ok = 1;
-        if (w->has_chain_file)
-            save_ok = chainset_save(w->chain_file, &result) == 0;
-        free(w->cs.c);
-        w->cs = result;
         w->has_cs = 1;
+        int save_ok = watches_save() == 0;
         if (!save_ok)
-            snprintf(w->status, sizeof w->status, "SAVE FAILED: %.55s", w->chain_file);
+            snprintf(w->status, sizeof w->status, "SAVE FAILED: %.40s", watches_path());
         else if (same_proc)
             snprintf(w->status, sizeof w->status, "no new scan; restart game [saved]");
         else
-            snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s) -> %.55s",
-                     w->cs.n, w->cs.scans, w->cs.scans == 1 ? "" : "s", w->chain_file);
+            snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s) [saved]",
+                     w->cs.n, w->cs.scans, w->cs.scans == 1 ? "" : "s");
         free(fresh.c);
     } else {
         search_filter(&w->s, a->mode, a->param, a->tol, &w->cancel);
@@ -2195,20 +2789,6 @@ static void tui_reset(Watch *w)
     snprintf(w->status, sizeof w->status, "reset");
 }
 
-static void tui_chain_path(Watch *w)
-{
-    char safe[64];
-    size_t j = 0;
-    for (size_t i = 0; w->name[i] && j < sizeof safe - 1; i++) {
-        unsigned char ch = (unsigned char)w->name[i];
-        safe[j++] = (isalnum(ch) || ch == '_' || ch == '-' || ch == '.') ? (char)ch : '_';
-    }
-    safe[j] = 0;
-    mkdir("chains", 0755);
-    snprintf(w->chain_file, sizeof w->chain_file, "chains/%s.chain", j ? safe : "watch");
-    w->has_chain_file = 1;
-}
-
 /* resolve the first (best) chain in w->cs and bind it as the watch address */
 static void watch_bind_chain(Watch *w)
 {
@@ -2242,23 +2822,17 @@ static void watch_bind_chain(Watch *w)
     snprintf(w->status, sizeof w->status, "auto chain -> 0x%llx", (unsigned long long)addr);
 }
 
-/* on 'a': if a chain file for this name exists, load it; auto-bind only if verified */
+/* after load: bind the chain if verified, else report status */
 static void watch_autoload_chain(Watch *w)
 {
-    if (!w->has_chain_file)
-        tui_chain_path(w);
-    ChainSet cs;
-    if (chainset_load(w->chain_file, &cs) != 0)
+    if (!w->has_cs)
         return;
-    free(w->cs.c);
-    w->cs = cs;
-    w->has_cs = 1;
-    if (!chain_is_stable(&cs)) {
-        if (cs.n == 0)
-            snprintf(w->status, sizeof w->status, "chain file empty");
+    if (!chain_is_stable(&w->cs)) {
+        if (w->cs.n == 0)
+            snprintf(w->status, sizeof w->status, "chain: 0 cand");
         else
             snprintf(w->status, sizeof w->status,
-                     "chain: %u cand (unverified: press C or V)", cs.n);
+                     "chain: %u cand (unverified: press C or V)", w->cs.n);
         return;
     }
     watch_bind_chain(w);
@@ -2269,14 +2843,7 @@ static void tui_verify_chain(Watch *w)
 {
     if (w->scanning)
         return;
-    if (!w->has_cs) {
-        watch_autoload_chain(w);
-        if (!w->has_cs) {
-            snprintf(w->status, sizeof w->status, "no chain file");
-            return;
-        }
-    }
-    if (w->cs.n == 0) {
+    if (!w->has_cs || w->cs.n == 0) {
         snprintf(w->status, sizeof w->status, "no chains");
         return;
     }
@@ -2296,8 +2863,7 @@ static void tui_verify_chain(Watch *w)
         w->cs.token = tok;
     }
     if (w->cs.n > 0) {
-        if (w->has_chain_file)
-            chainset_save(w->chain_file, &w->cs);
+        watches_save();
         snprintf(w->status, sizeof w->status, "verify: %u -> %u (%u verify%s)%s",
                  before, w->cs.n, w->cs.verifies, w->cs.verifies == 1 ? "" : "s",
                  same ? " same-proc" : "");
@@ -2317,8 +2883,6 @@ static void tui_chain_scan(Watch *w)
         snprintf(w->status, sizeof w->status, "bind an address first");
         return;
     }
-    if (!w->has_chain_file)
-        tui_chain_path(w);
     watch_start(w, SCAN_CHAIN, 0, 0);
 }
 
@@ -2326,87 +2890,46 @@ static void tui_load_chain(Watch *w)
 {
     if (w->scanning)
         return;
-    if (!w->has_chain_file)
-        tui_chain_path(w);
-    ChainSet cs;
-    int r = chainset_load(w->chain_file, &cs);
-    if (r != 0) {
-        snprintf(w->status, sizeof w->status, "no chain file");
+    if (!w->has_cs || w->cs.n == 0) {
+        snprintf(w->status, sizeof w->status, "no chains");
         return;
     }
-    if (cs.n == 0) {
-        snprintf(w->status, sizeof w->status, "chain file empty");
-        free(cs.c);
-        return;
-    }
-    CMap *m = NULL;
-    size_t nm = 0;
-    if (cmaps_read(g_pid, &m, &nm) != 0) {
-        snprintf(w->status, sizeof w->status, "open maps failed");
-        free(cs.c);
-        return;
-    }
-    uint64_t modbase = chain_module_base(m, nm, cs.module);
-    uint64_t addr;
-    if (!modbase || !chain_resolve(g_pid, m, nm, modbase, &cs.c[0], &addr)) {
-        snprintf(w->status, sizeof w->status, "chain failed to resolve");
-        free(m);
-        free(cs.c);
-        return;
-    }
-    free(m);
-    w->addr = addr;
-    w->has_addr = 1;
-    if (!w->has_lockval) {
-        int ok;
-        w->lock_bits = read_at(addr, &ok);
-        if (ok)
-            w->has_lockval = 1;
-    }
-    snprintf(w->status, sizeof w->status, "chain -> 0x%llx", (unsigned long long)addr);
-    free(w->cs.c);
-    w->cs = cs;
-    w->has_cs = 1;
+    watch_bind_chain(w);
 }
 
-#define WATCH_PATH ".ds3hp_watches"
-
-static void watch_name_sanitize(const char *in, char *out, size_t n)
+static int watches_save(void)
 {
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j + 1 < n; i++) {
-        char c = in[i];
-        out[j++] = (c == '\t' || c == '\n' || c == '\r') ? '_' : c;
-    }
-    out[j] = 0;
-}
-
-static void watches_save(void)
-{
-    FILE *f = fopen(WATCH_PATH, "w");
-    if (!f)
-        return;
-    fprintf(f, "DS3HPW1\n");
+    WatchEntry *arr = calloc(g_nw ? (size_t)g_nw : 1, sizeof(WatchEntry));
+    if (!arr)
+        return -1;
     for (int i = 0; i < g_nw; i++) {
         Watch *w = &g_w[i];
-        char nm[32];
-        watch_name_sanitize(w->name, nm, sizeof nm);
-        fprintf(f, "%s\t%d\t%d\t%u\t%d\n", nm, w->s.type, w->has_lockval,
-                w->lock_bits, w->lock_on);
+        WatchEntry *e = &arr[i];
+        snprintf(e->name, sizeof e->name, "%.23s", w->name);
+        e->type = w->s.type;
+        e->has_lockval = w->has_lockval;
+        e->lock_bits = w->lock_bits;
+        e->lock_on = w->lock_on;
+        e->has_chain = w->has_cs;
+        e->cs = w->cs;   /* shallow: only read while saving */
     }
-    fclose(f);
+    int r = entries_save(arr, g_nw);
+    free(arr);
+    return r;
 }
 
-static void watches_load(void)
+/* import the pre-JSON text watch list (".ds3hp_watches") once */
+static int legacy_watches_load(void)
 {
-    FILE *f = fopen(WATCH_PATH, "r");
+    FILE *f = fopen(".ds3hp_watches", "r");
     if (!f)
-        return;
+        return 0;
     char line[256];
     if (!fgets(line, sizeof line, f) || strncmp(line, "DS3HPW1", 7) != 0) {
         fclose(f);
-        return;
+        return 0;
     }
+    int cnt = 0;
     while (g_nw < MAX_WATCH && fgets(line, sizeof line, f)) {
         char nm[24];
         int type = 0, hl = 0, lo = 0;
@@ -2422,13 +2945,47 @@ static void watches_load(void)
         w->has_lockval = hl;
         w->lock_bits = bits;
         w->lock_on = lo;
+        snprintf(w->status, sizeof w->status, "migrated");
+        g_nw++;
+        cnt++;
+    }
+    fclose(f);
+    if (cnt)
+        fprintf(stderr, "note: imported %d watch(es) from .ds3hp_watches\n", cnt);
+    return cnt;
+}
+
+static void watches_load(void)
+{
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0)
+        return;
+    for (int i = 0; i < n && g_nw < MAX_WATCH; i++) {
+        WatchEntry *e = &arr[i];
+        Watch *w = &g_w[g_nw];
+        memset(w, 0, sizeof *w);
+        snprintf(w->name, sizeof w->name, "%s", e->name);
+        w->s.type = e->type;
+        w->s.min = 1.0;
+        w->s.max = 10000.0;
+        w->has_lockval = e->has_lockval;
+        w->lock_bits = e->lock_bits;
+        w->lock_on = e->lock_on;
+        if (e->has_chain) {
+            w->cs = e->cs;
+            w->has_cs = 1;
+            e->cs.c = NULL;   /* ownership transferred to the watch */
+        }
         snprintf(w->status, sizeof w->status, "restored");
         g_nw++;
     }
-    fclose(f);
+    entries_free(arr, n);
+    if (g_nw == 0 && legacy_watches_load() > 0)
+        watches_save();
 }
 
-/* after restart: load each watch's chain file; auto-bind only if verified */
+/* after restart: bind verified chains, report the rest */
 static void watches_autoresolve(void)
 {
     for (int i = 0; i < g_nw; i++)
@@ -2530,12 +3087,9 @@ static void tui_candidates(Watch *w)
 
 static void tui_chains(Watch *w)
 {
-    if (!w->has_cs) {
-        watch_autoload_chain(w);
-        if (!w->has_cs || w->cs.n == 0) {
-            snprintf(w->status, sizeof w->status, "no chains");
-            return;
-        }
+    if (!w->has_cs || w->cs.n == 0) {
+        snprintf(w->status, sizeof w->status, "no chains");
+        return;
     }
     uint32_t n = w->cs.n;
     uint64_t *addrs = malloc((n ? n : 1) * sizeof(uint64_t));
@@ -2721,8 +3275,6 @@ static void tui_draw(void)
     int datarows = (rows - 6) - 4 + 1;
     if (datarows < 0)
         datarows = 0;
-    if (g_nw == 0)
-        mvprintw(4, 2, "(press 'a' to add a watch)");
     for (int i = 0; i < g_nw && i < datarows; i++) {
         Watch *w = &g_w[i];
         char addr[24] = "--";
@@ -2742,8 +3294,6 @@ static void tui_draw(void)
                 snprintf(chn, sizeof chn, "stable");
             else
                 snprintf(chn, sizeof chn, "%uc", w->cs.n);
-        } else if (w->has_chain_file && access(w->chain_file, F_OK) == 0) {
-            snprintf(chn, sizeof chn, "file");
         }
         char st[80];
         if (w->scanning) {
@@ -2763,11 +3313,11 @@ static void tui_draw(void)
         if (i == g_cur)
             mvchgat(4 + i, 1, innerw, A_REVERSE, 0, NULL);
     }
-    if (g_nw > 0) {
-        const char *empty[8] = { "", "", "", "", "", "", "", "" };
-        for (int i = g_nw; i < datarows; i++)
-            tui_trow(4 + i, empty, 8, cw);
-    }
+    const char *empty[8] = { "", "", "", "", "", "", "", "" };
+    for (int i = g_nw; i < datarows; i++)
+        tui_trow(4 + i, empty, 8, cw);
+    if (g_nw == 0 && datarows > 0)
+        mvprintw(4, 2, "(press 'a' to add a watch)");
     tui_hline(rows - 5, innerw, "╰", "╯");
     mvprintw(rows - 4, 0, "addr : a add  x del  f first  d/i dec/inc  c/u changed/unchanged  e eq  Enter cand  r reset");
     mvprintw(rows - 3, 0, "value: v lockval  s once  l hold");
@@ -2942,10 +3492,12 @@ static void cmd_tui(int argc, char **argv)
             pthread_join(w->th, NULL);
             w->th_valid = 0;
         }
-        free(w->s.c);
-        free(w->cs.c);
     }
     watches_save();
+    for (int i = 0; i < g_nw; i++) {
+        free(g_w[i].s.c);
+        free(g_w[i].cs.c);
+    }
     endwin();
     printf("bye\n");
 }
@@ -2966,13 +3518,15 @@ static void usage(const char *prog)
     printf("        freeze one or more values at once (defaults to each value now)\n");
     printf("  set   <index|a-b|all> --value V\n");
     printf("        write V once to the chosen candidates\n");
-    printf("  chain scan   <file> --addr 0xADDR [--depth N] [--max-offset M] [--module S] [--pid P] [--type float|int] [--reset]\n");
+    printf("  chain scan   <watch> --addr 0xADDR [--depth N] [--max-offset M] [--module S] [--pid P] [--type float|int] [--reset]\n");
     printf("        scan for restart-stable pointer chains; re-run after a restart to intersect\n");
-    printf("  chain list   <file>       show candidate chains\n");
-    printf("  chain resolve <file> [--index K] [--value V]   resolve a chain to an address\n");
-    printf("  chain verify <file> --value V [--pid P]         keep chains whose value == V\n");
-    printf("  chain load   <file> [--index K] [--value V]    resolve and load as current target\n");
-    printf("  chain clear  <file>       delete a chain file\n");
+    printf("  chain list   [<watch>] [--pid P]  list watches, or one watch's chains\n");
+    printf("  chain resolve <watch> [--index K] [--value V] [--pid P]   resolve a chain\n");
+    printf("  chain verify <watch> --value V [--pid P]        keep chains whose value == V\n");
+    printf("  chain load   <watch> [--index K] [--value V]    resolve and load as current target\n");
+    printf("  chain clear  <watch>      remove the watch's chain\n");
+    printf("  chain rm     <watch>      remove the watch entirely\n");
+    printf("  watches are stored in %s\n", watches_path());
     printf("  reset                     delete saved scan state\n\n");
     printf("typical run (float HP):\n");
     printf("  %s tui               # or use the CLI steps below\n", prog);

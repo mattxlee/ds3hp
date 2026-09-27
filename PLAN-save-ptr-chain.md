@@ -268,3 +268,5 @@ g = 加载已保存链并绑定地址
 补充（同日，链列表）：`chain list <file> [--pid P]` 加 `--pid` 后逐条解析并显示地址与当前值；TUI 新增 `L` 键打开链列表视图（显示每条链的格式、解析地址、当前值），`j/k` 选择、`Enter` 绑定所选链、`q` 返回。便于当多条链都通过验证时人工比较（例如区分同值的多个地址/真假链）。
 
 补充（同日，verify 放宽 + 自动重连）：verify 不再硬性要求重启——同进程也可执行，只是**不计入 `verifies`、不影响 stable**（同进程内所有链本就都解析到同一目标，无区分度）；跨进程 verify 才计数并更新 `token`。TUI 每 500ms 检测当前 pid 是否仍存活（`/proc/pid/comm`），失效则自动 `detect_pid` 重连、清空各 Watch 的过期地址、并重跑 `watches_autoresolve`（stable 链自动重新绑定），标题短暂显示 `reconnected to new pid`；`p` 键行为相同。注意 `detect_pid` 在存在多个同名进程时取第一个匹配，可能选错，必要时仍可用 `--pid`。
+
+补充（同日，JSON 存储）：所有 Watch（含各自 chain）合并存到单个 JSON：`~/.config/ds3hp/watches.json`（遵循 `XDG_CONFIG_HOME`）。顶层键即 watch name（保留 `_version`）。每个 Watch：`type`、可选 `lock_value`（int 存整数、float 存 `%.9g`）、`lock_on`，以及可选 `chain`（`module`/`scans`/`verifies`/`token`/`list`，每项 `{rva, offs[]}`）。自带最小 JSON 解析/生成器（对象/数组/字符串/数字/布尔 + 转义、深度上限），读写做体积/边界校验。CLI `chain` 子命令改为按 watch 名操作该文件：`scan/list/resolve/verify/load/clear/rm`（`chain list` 无参数时列出全部 watch）。TUI 的 `C/V/L/G` 与退出保存全部落到这个文件。旧的 `.ds3hp_watches`（文本）会在首次启动、JSON 为空时自动导入并迁移；旧 `chains/*.chain` 需重扫（或手工把链填进 JSON）。
