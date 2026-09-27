@@ -252,3 +252,5 @@ g = 加载已保存链并绑定地址
 - **测试**：用 `.review-tmp/fake.c` 验证了单次扫描命中真链、跨 3 次重启交集剔除深层巧合链、`resolve`/`load` 精确恢复到新地址、`--value` 校验、5 类畸形文件干净报错、ASan/UBSan 下 scan+交集无报错。
 
 与计划的两处偏差：文件格式新增 `type` 字段；TUI 键位用 `C`/`G` 而非 `c`/`g`。
+
+补充（同日）：链文件新增 `token` 字段（进程标识 = `/proc/pid/stat` 的 starttime 混合 pid）。若再次扫描与上次同一进程，则不递增交集计数、不改变已存集合，并提示"restart game first"；只有真正重启（token 变化）才计入交集。CLI 与 TUI 均已接入。

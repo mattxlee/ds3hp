@@ -770,7 +770,7 @@ static void cmd_reset(void)
 /* ======================= pointer chains ======================= */
 
 #define CHAIN_MAGIC "DS3CHAIN"
-#define CHAIN_VERSION 1
+#define CHAIN_VERSION 2
 #define CHAIN_MAX 8
 #define CHAIN_MAX_OFF (1u << 20)
 #define CHAIN_MAX_PROBES 8000000u
@@ -786,6 +786,7 @@ typedef struct {
     int type;
     char module[256];
     uint32_t scans;
+    uint64_t token;
     Chain *c;
     uint32_t n, cap;
 } ChainSet;
@@ -866,6 +867,43 @@ static uint64_t chain_module_base(const CMap *m, size_t n, const char *sub)
             (base == 0 || m[i].start < base))
             base = m[i].start;
     return base;
+}
+
+/* per-process token: starttime (jiffies since boot) mixed with pid, so two
+ * scans of the same game instance compare equal but a restart does not */
+static uint64_t process_token(int pid)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    char buf[1024];
+    if (!fgets(buf, sizeof buf, f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    char *p = strrchr(buf, ')');
+    if (!p)
+        return 0;
+    const char *q = p + 1;
+    long field = 3;
+    uint64_t starttime = 0;
+    while (*q) {
+        while (*q == ' ')
+            q++;
+        if (!*q)
+            break;
+        if (field == 22) {
+            starttime = strtoull(q, NULL, 10);
+            break;
+        }
+        while (*q && *q != ' ')
+            q++;
+        field++;
+    }
+    return starttime * 2654435761ull + (uint64_t)(uint32_t)pid;
 }
 
 static int chain_is_static(const CMap *m, size_t n, uint64_t a, const char *mod)
@@ -1197,12 +1235,14 @@ static int chainset_save(const char *file, const ChainSet *cs)
     uint32_t ver = CHAIN_VERSION;
     uint32_t scans = cs->scans;
     int32_t type = cs->type;
+    uint64_t token = cs->token;
     uint16_t ml = (uint16_t)strlen(cs->module);
     uint32_t cnt = cs->n;
     fwrite(CHAIN_MAGIC, 1, 8, f);
     fwrite(&ver, 4, 1, f);
     fwrite(&scans, 4, 1, f);
     fwrite(&type, 4, 1, f);
+    fwrite(&token, 8, 1, f);
     fwrite(&ml, 2, 1, f);
     if (ml)
         fwrite(cs->module, 1, ml, f);
@@ -1225,13 +1265,15 @@ static int chainset_load(const char *file, ChainSet *cs)
     char magic[8];
     uint32_t ver = 0, scans = 0, cnt = 0;
     int32_t type = 0;
+    uint64_t token = 0;
     uint16_t ml = 0;
     int ok = 1;
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, CHAIN_MAGIC, 8) != 0)
         ok = 0;
     if (ok && (fread(&ver, 4, 1, f) != 1 || ver != CHAIN_VERSION))
         ok = 0;
-    if (ok && (fread(&scans, 4, 1, f) != 1 || fread(&type, 4, 1, f) != 1))
+    if (ok && (fread(&scans, 4, 1, f) != 1 || fread(&type, 4, 1, f) != 1 ||
+               fread(&token, 8, 1, f) != 1))
         ok = 0;
     if (ok && (fread(&ml, 2, 1, f) != 1 || ml >= sizeof cs->module))
         ok = 0;
@@ -1256,6 +1298,7 @@ static int chainset_load(const char *file, ChainSet *cs)
     cs->n = 0;
     cs->scans = scans;
     cs->type = type;
+    cs->token = token;
     for (uint32_t i = 0; i < cnt; i++) {
         uint8_t n;
         if (fread(&arr[i].rva, 8, 1, f) != 1 || fread(&n, 1, 1, f) != 1 ||
@@ -1395,8 +1438,13 @@ static int cmd_chain_scan(int argc, char **argv)
     printf("scan: %u candidate chain(s) in %.1fs\n", fresh.n, dt);
 
     ChainSet result = {0};
-    if (have_prev) {
+    uint64_t tok = process_token(g_pid);
+    if (have_prev && prev.token != 0 && prev.token == tok) {
+        fprintf(stderr, "note: same process as last scan (pid %d); restart the game before scanning again\n", g_pid);
+        result = prev;
+    } else if (have_prev) {
         chainset_intersect(&prev, &fresh, &result);
+        result.token = tok;
         printf("intersect: %u -> %u chain(s) (scan #%u)\n", prev.n, result.n, result.scans);
         free(prev.c);
     } else {
@@ -1404,6 +1452,7 @@ static int cmd_chain_scan(int argc, char **argv)
         result.type = type;
         snprintf(result.module, sizeof result.module, "%s", mod);
         result.scans = 1;
+        result.token = tok;
         memset(&fresh, 0, sizeof fresh);
         printf("saved %u candidate chain(s) (scan #1)\n", result.n);
         if (result.n == 0)
@@ -1726,10 +1775,18 @@ static void *scan_thread(void *p)
         w->total = total;
         ChainSet result = {0};
         ChainSet prev;
+        uint64_t tok = process_token(g_pid);
+        int same_proc = 0;
         if (w->has_chain_file && access(w->chain_file, F_OK) == 0 &&
             chainset_load(w->chain_file, &prev) == 0) {
-            chainset_intersect(&prev, &fresh, &result);
-            free(prev.c);
+            if (prev.token != 0 && prev.token == tok) {
+                same_proc = 1;
+                result = prev;
+            } else {
+                chainset_intersect(&prev, &fresh, &result);
+                result.token = tok;
+                free(prev.c);
+            }
             free(fresh.c);
             fresh.c = NULL;
         } else {
@@ -1738,14 +1795,18 @@ static void *scan_thread(void *p)
             result.type = w->s.type;
             snprintf(result.module, sizeof result.module, "%s", "DarkSoulsIII.exe");
             result.scans = 1;
+            result.token = tok;
         }
         if (w->has_chain_file)
             chainset_save(w->chain_file, &result);
         free(w->cs.c);
         w->cs = result;
         w->has_cs = 1;
-        snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s)", w->cs.n,
-                 w->cs.scans, w->cs.scans == 1 ? "" : "s");
+        if (same_proc)
+            snprintf(w->status, sizeof w->status, "restart game first (%u scan)", w->cs.scans);
+        else
+            snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s)", w->cs.n,
+                     w->cs.scans, w->cs.scans == 1 ? "" : "s");
         free(fresh.c);
     } else {
         search_filter(&w->s, a->mode, a->param, a->tol, &w->cancel);
