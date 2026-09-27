@@ -1,6 +1,6 @@
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
-LDLIBS ?= -lm
+CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -pthread
+LDLIBS ?= -lm -lncursesw
 
 ds3hp: ds3hp.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
