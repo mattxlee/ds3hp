@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <math.h>
 #include <time.h>
+#include <locale.h>
 #include <pthread.h>
 #include <sys/uio.h>
 #include <sys/types.h>
@@ -130,6 +131,20 @@ static int detect_pid(void)
     }
     closedir(d);
     return found;
+}
+
+static int pid_ok(int pid)
+{
+    if (pid <= 0)
+        return 0;
+    char path[64], comm[256];
+    snprintf(path, sizeof path, "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    int ok = fgets(comm, sizeof comm, f) && strncmp(comm, "DarkSoulsIII", 12) == 0;
+    fclose(f);
+    return ok;
 }
 
 static void push_cand(Search *s, uint64_t addr, uint32_t bits)
@@ -987,7 +1002,6 @@ static int chain_verify(ChainSet *cs, int pid, double val)
     }
     free(m);
     cs->n = out;
-    cs->verifies++;
     return (int)out;
 }
 
@@ -1542,19 +1556,56 @@ static ChainSet chain_load_file(const char *file)
 
 static void cmd_chain_list(int argc, char **argv)
 {
-    if (argc < 1) {
-        fprintf(stderr, "error: chain list <file>\n");
+    const char *file = NULL;
+    int pid = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+            pid = atoi(argv[++i]);
+        else if (!file)
+            file = argv[i];
+        else {
+            fprintf(stderr, "error: unknown option %s\n", argv[i]);
+            exit(1);
+        }
+    }
+    if (!file) {
+        fprintf(stderr, "error: chain list <file> [--pid P]\n");
         exit(1);
     }
-    ChainSet cs = chain_load_file(argv[0]);
-    printf("%s: %u chain(s), %u scan(s), module %s, type %s\n", argv[0], cs.n,
-           cs.scans, cs.module, cs.type == T_FLOAT ? "float" : "int");
+    ChainSet cs = chain_load_file(file);
+    printf("%s: %u chain(s), %u scan(s), %u verify/ies, module %s, type %s\n", file,
+           cs.n, cs.scans, cs.verifies, cs.module,
+           cs.type == T_FLOAT ? "float" : "int");
+    CMap *m = NULL;
+    size_t nm = 0;
+    uint64_t modbase = 0;
+    if (pid) {
+        g_pid = pid;
+        if (cmaps_read(pid, &m, &nm) == 0)
+            modbase = chain_module_base(m, nm, cs.module);
+    }
     for (uint32_t i = 0; i < cs.n; i++) {
         char b[512];
         chain_format(&cs.c[i], cs.module, b, sizeof b);
-        printf("  [%u] %s  (%u deref%s, total 0x%llx)\n", i, b, cs.c[i].n,
+        printf("  [%u] %s  (%u deref%s, total 0x%llx)", i, b, cs.c[i].n,
                cs.c[i].n == 1 ? "" : "s", (unsigned long long)chain_total_off(&cs.c[i]));
+        if (pid) {
+            uint64_t addr;
+            if (modbase && chain_resolve(pid, m, nm, modbase, &cs.c[i], &addr)) {
+                int ok;
+                uint32_t v = read_at(addr, &ok);
+                if (ok)
+                    printf("  @0x%llx = %g", (unsigned long long)addr,
+                           bits_to_val(cs.type, v));
+                else
+                    printf("  @0x%llx = <unreadable>", (unsigned long long)addr);
+            } else {
+                printf("  (unresolved)");
+            }
+        }
+        printf("\n");
     }
+    free(m);
     free(cs.c);
 }
 
@@ -1746,17 +1797,17 @@ static void cmd_chain_verify(int argc, char **argv)
         fprintf(stderr, "error: Dark Souls III process not found\n");
         exit(1);
     }
-    if (cs.token != 0 && cs.token == process_token(g_pid)) {
-        fprintf(stderr, "same process as last scan; restart the game before verifying"
-                        " (verify needs a new layout to filter)\n");
-        free(cs.c);
-        return;
-    }
+    uint64_t tok = process_token(g_pid);
+    int same = cs.token != 0 && cs.token == tok;
     uint32_t before = cs.n;
     int r = chain_verify(&cs, g_pid, val);
     if (r < 0) {
         free(cs.c);
         exit(1);
+    }
+    if (!same) {
+        cs.verifies++;
+        cs.token = tok;
     }
     if (cs.n == 0) {
         fprintf(stderr, "no chain matched %g; %u candidate(s) kept (not saved)\n",
@@ -1768,15 +1819,15 @@ static void cmd_chain_verify(int argc, char **argv)
         free(cs.c);
         exit(1);
     }
-    printf("verify: %u -> %u chain(s) against %g (%u verify/ies)\n", before, cs.n,
-           val, cs.verifies);
-    if (chain_is_stable(&cs)) {
+    printf("verify: %u -> %u chain(s) against %g (%u verify/ies)%s\n", before, cs.n,
+           val, cs.verifies, same ? " [same process, not counted]" : "");
+    if (!same && chain_is_stable(&cs)) {
         char b[512];
         chain_format(&cs.c[0], cs.module, b, sizeof b);
         printf("stable chain: %s\n", b);
         printf("use: ds3hp chain load %s\n", file);
     } else {
-        printf("still %u candidate(s); repeat with another value or restart\n", cs.n);
+        printf("still %u candidate(s); repeat after a restart with another value\n", cs.n);
     }
     free(cs.c);
 }
@@ -1855,6 +1906,8 @@ static Watch g_w[MAX_WATCH];
 static int g_nw = 0;
 static int g_cur = 0;
 static long long g_t0_ms = 0;
+static char g_notice[64];
+static long long g_notice_until = 0;
 
 typedef struct {
     Watch *w;
@@ -1867,6 +1920,12 @@ static long long now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void set_notice(const char *s)
+{
+    snprintf(g_notice, sizeof g_notice, "%s", s);
+    g_notice_until = now_ms() + 4000;
 }
 
 static void *scan_thread(void *p)
@@ -2221,25 +2280,28 @@ static void tui_verify_chain(Watch *w)
         snprintf(w->status, sizeof w->status, "no chains");
         return;
     }
-    if (w->cs.token != 0 && w->cs.token == process_token(g_pid)) {
-        snprintf(w->status, sizeof w->status, "restart game to verify (same process)");
-        return;
-    }
     char v[32];
     if (!tui_prompt("current value: ", v, sizeof v) || !v[0])
         return;
+    uint64_t tok = process_token(g_pid);
+    int same = w->cs.token != 0 && w->cs.token == tok;
     uint32_t before = w->cs.n;
     int r = chain_verify(&w->cs, g_pid, atof(v));
     if (r < 0) {
         snprintf(w->status, sizeof w->status, "verify failed");
         return;
     }
+    if (!same) {
+        w->cs.verifies++;
+        w->cs.token = tok;
+    }
     if (w->cs.n > 0) {
         if (w->has_chain_file)
             chainset_save(w->chain_file, &w->cs);
-        snprintf(w->status, sizeof w->status, "verify: %u -> %u (%u verify%s)",
-                 before, w->cs.n, w->cs.verifies, w->cs.verifies == 1 ? "" : "s");
-        if (chain_is_stable(&w->cs))
+        snprintf(w->status, sizeof w->status, "verify: %u -> %u (%u verify%s)%s",
+                 before, w->cs.n, w->cs.verifies, w->cs.verifies == 1 ? "" : "s",
+                 same ? " same-proc" : "");
+        if (!same && chain_is_stable(&w->cs))
             watch_bind_chain(w);
     } else {
         snprintf(w->status, sizeof w->status,
@@ -2466,6 +2528,126 @@ static void tui_candidates(Watch *w)
     }
 }
 
+static void tui_chains(Watch *w)
+{
+    if (!w->has_cs) {
+        watch_autoload_chain(w);
+        if (!w->has_cs || w->cs.n == 0) {
+            snprintf(w->status, sizeof w->status, "no chains");
+            return;
+        }
+    }
+    uint32_t n = w->cs.n;
+    uint64_t *addrs = malloc((n ? n : 1) * sizeof(uint64_t));
+    uint32_t *vals = malloc((n ? n : 1) * sizeof(uint32_t));
+    uint8_t *ok = malloc(n ? n : 1);
+    CMap *m = NULL;
+    size_t nm = 0;
+    uint64_t modbase = 0;
+    if (cmaps_read(g_pid, &m, &nm) == 0)
+        modbase = chain_module_base(m, nm, w->cs.module);
+    for (uint32_t i = 0; i < n; i++) {
+        addrs[i] = 0;
+        ok[i] = 0;
+        if (modbase && chain_resolve(g_pid, m, nm, modbase, &w->cs.c[i], &addrs[i])) {
+            int o;
+            vals[i] = read_at(addrs[i], &o);
+            ok[i] = o;
+        }
+    }
+    free(m);
+    if (!addrs || !vals || !ok) {
+        free(addrs);
+        free(vals);
+        free(ok);
+        return;
+    }
+
+    size_t sel = 0, top = 0;
+    for (;;) {
+        if (g_stop)
+            break;
+        erase();
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        (void)cols;
+        attron(A_BOLD);
+        mvprintw(0, 0, "chains: %s (%u candidate%s, ranked)", w->name, n,
+                 n == 1 ? "" : "s");
+        attroff(A_BOLD);
+        int listrows = rows - 3;
+        if (listrows < 1)
+            listrows = 1;
+        if (sel < top)
+            top = sel;
+        if (sel >= top + (size_t)listrows)
+            top = sel - listrows + 1;
+        for (int i = 0; i < listrows; i++) {
+            size_t idx = top + i;
+            if (idx >= n)
+                break;
+            char b[256];
+            chain_format(&w->cs.c[idx], w->cs.module, b, sizeof b);
+            if (ok[idx])
+                mvprintw(2 + i, 0, "[%zu] %-40.40s @0x%llx = %g", idx, b,
+                         (unsigned long long)addrs[idx],
+                         bits_to_val(w->cs.type, vals[idx]));
+            else
+                mvprintw(2 + i, 0, "[%zu] %-40.40s (unresolved)", idx, b);
+            if (idx == sel)
+                mvchgat(2 + i, 0, -1, A_REVERSE, 0, NULL);
+        }
+        mvprintw(rows - 1, 0, "j/k move  PgUp/PgDn  Enter=bind selected  q=back");
+        refresh();
+        int ch = getch();
+        if (ch == ERR)
+            continue;
+        switch (ch) {
+        case 'q':
+        case 27:
+            goto done;
+        case 'j':
+        case KEY_DOWN:
+            if (sel + 1 < n)
+                sel++;
+            break;
+        case 'k':
+        case KEY_UP:
+            if (sel)
+                sel--;
+            break;
+        case KEY_NPAGE:
+            sel += listrows;
+            if (sel >= n)
+                sel = n ? n - 1 : 0;
+            break;
+        case KEY_PPAGE:
+            sel = sel > (size_t)listrows ? sel - listrows : 0;
+            break;
+        case '\n':
+        case '\r':
+        case KEY_ENTER:
+            if (ok[sel]) {
+                w->addr = addrs[sel];
+                w->has_addr = 1;
+                if (!w->has_lockval) {
+                    w->lock_bits = vals[sel];
+                    w->has_lockval = 1;
+                }
+                snprintf(w->status, sizeof w->status, "bound [%zu] 0x%llx", sel,
+                         (unsigned long long)w->addr);
+            } else {
+                snprintf(w->status, sizeof w->status, "[%zu] unresolved", sel);
+            }
+            goto done;
+        }
+    }
+done:
+    free(addrs);
+    free(vals);
+    free(ok);
+}
+
 static void tui_refresh_values(void)
 {
     for (int i = 0; i < g_nw; i++) {
@@ -2490,6 +2672,27 @@ static void tui_lock_tick(void)
     }
 }
 
+static void tui_hline(int row, int innerw, const char *l, const char *r)
+{
+    move(row, 0);
+    addstr(l);
+    for (int j = 0; j < innerw; j++)
+        addstr("─");
+    addstr(r);
+}
+
+static void tui_trow(int row, const char *const *cells, int ncols, const int *w)
+{
+    move(row, 0);
+    addstr("│");
+    for (int k = 0; k < ncols; k++) {
+        printw("%-*.*s", w[k], w[k], cells[k]);
+        if (k < ncols - 1)
+            addstr(" ");
+    }
+    addstr("│");
+}
+
 static void tui_draw(void)
 {
     erase();
@@ -2497,16 +2700,30 @@ static void tui_draw(void)
     getmaxyx(stdscr, rows, cols);
     (void)cols;
     attron(A_BOLD);
-    mvprintw(0, 0, "ds3hp tui   pid=%d   %d watch(es)", g_pid, g_nw);
+    if (now_ms() < g_notice_until)
+        mvprintw(0, 0, "ds3hp tui   pid=%d   %d watch(es)   [%s]", g_pid, g_nw, g_notice);
+    else
+        mvprintw(0, 0, "ds3hp tui   pid=%d   %d watch(es)", g_pid, g_nw);
     attroff(A_BOLD);
-    mvprintw(1, 0, "%-8s %-5s %-16s %10s %3s %10s %-7s %s",
-             "NAME", "TYPE", "ADDR", "VALUE", "LCK", "LOCKVAL", "CHAIN", "STATUS");
-    int listrows = rows - 4;
-    if (listrows < 1)
-        listrows = 1;
+
+    int cw[8] = { 8, 5, 16, 10, 3, 10, 7, 0 };
+    int statusw = cols - 69;
+    if (statusw < 6)
+        statusw = 6;
+    cw[7] = statusw;
+    int innerw = 0;
+    for (int k = 0; k < 8; k++)
+        innerw += cw[k] + (k < 7 ? 1 : 0);
+    const char *hdr[8] = { "NAME", "TYPE", "ADDR", "VALUE", "LCK", "LOCKVAL", "CHAIN", "STATUS" };
+    tui_hline(1, innerw, "╭", "╮");
+    tui_trow(2, hdr, 8, cw);
+    tui_hline(3, innerw, "├", "┤");
+    int datarows = (rows - 6) - 4 + 1;
+    if (datarows < 0)
+        datarows = 0;
     if (g_nw == 0)
-        mvprintw(2, 0, "(press 'a' to add a watch)");
-    for (int i = 0; i < g_nw && i < listrows; i++) {
+        mvprintw(4, 2, "(press 'a' to add a watch)");
+    for (int i = 0; i < g_nw && i < datarows; i++) {
         Watch *w = &g_w[i];
         char addr[24] = "--";
         if (w->has_addr)
@@ -2538,14 +2755,24 @@ static void tui_draw(void)
         } else {
             snprintf(st, sizeof st, "%s", w->status);
         }
-        mvprintw(2 + i, 0, "%-8.8s %-5s %-16.16s %10.10s %3s %10.10s %-7.7s %-.40s",
-                 w->name, w->s.type == T_FLOAT ? "float" : "int", addr, val,
-                 w->lock_on ? (w->has_lockval ? "ON" : "?") : "off", lv, chn, st);
+        const char *cells[8] = {
+            w->name, w->s.type == T_FLOAT ? "float" : "int", addr, val,
+            w->lock_on ? (w->has_lockval ? "ON" : "?") : "off", lv, chn, st
+        };
+        tui_trow(4 + i, cells, 8, cw);
         if (i == g_cur)
-            mvchgat(2 + i, 0, -1, A_REVERSE, 0, NULL);
+            mvchgat(4 + i, 1, innerw, A_REVERSE, 0, NULL);
     }
-    mvprintw(rows - 1, 0,
-             "a add f first d/i dec/inc c/u chg/unch e eq Enter cand l lock v lval s once C chain V verify G get x del r reset p pid q quit");
+    if (g_nw > 0) {
+        const char *empty[8] = { "", "", "", "", "", "", "", "" };
+        for (int i = g_nw; i < datarows; i++)
+            tui_trow(4 + i, empty, 8, cw);
+    }
+    tui_hline(rows - 5, innerw, "╰", "╯");
+    mvprintw(rows - 4, 0, "addr : a add  x del  f first  d/i dec/inc  c/u changed/unchanged  e eq  Enter cand  r reset");
+    mvprintw(rows - 3, 0, "value: v lockval  s once  l hold");
+    mvprintw(rows - 2, 0, "chain: C scan/intersect  V verify  L list  G load/bind");
+    mvprintw(rows - 1, 0, "misc : j/k move  p pid  q quit");
     refresh();
 }
 
@@ -2558,8 +2785,13 @@ static void tui_handle(int ch)
         break;
     case 'p': {
         int p = detect_pid();
-        if (p)
+        if (p) {
             g_pid = p;
+            for (int i = 0; i < g_nw; i++)
+                g_w[i].has_addr = 0;
+            watches_autoresolve();
+            set_notice("pid updated");
+        }
         break;
     }
     case KEY_UP:
@@ -2637,6 +2869,10 @@ static void tui_handle(int ch)
         if (g_nw)
             tui_verify_chain(&g_w[g_cur]);
         break;
+    case 'L':
+        if (g_nw)
+            tui_chains(&g_w[g_cur]);
+        break;
     case 'G':
         if (g_nw)
             tui_load_chain(&g_w[g_cur]);
@@ -2663,6 +2899,7 @@ static void cmd_tui(int argc, char **argv)
         fprintf(stderr, "warning: Dark Souls III not found; press 'p' to re-detect\n");
     watches_load();
     watches_autoresolve();
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
@@ -2674,8 +2911,20 @@ static void cmd_tui(int argc, char **argv)
     signal(SIGTERM, on_sigint);
     g_t0_ms = now_ms();
     long long last_refresh = 0;
+    long long last_pidcheck = 0;
     while (!g_stop) {
         long long now = now_ms();
+        if (!pid_ok(g_pid) && now - last_pidcheck >= 500) {
+            last_pidcheck = now;
+            int p = detect_pid();
+            if (p && p != g_pid) {
+                g_pid = p;
+                for (int i = 0; i < g_nw; i++)
+                    g_w[i].has_addr = 0;   /* addresses are stale in the new process */
+                watches_autoresolve();
+                set_notice("reconnected to new pid");
+            }
+        }
         if (now - last_refresh >= 100) {
             tui_refresh_values();
             last_refresh = now;
