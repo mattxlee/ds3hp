@@ -135,6 +135,8 @@ ds3hp chain scan   <file> --addr 0xADDR [--depth N] [--max-offset M] [--module S
 ds3hp chain list   <file>            # 列出候选链（深度/总偏移/启发式评分）
 ds3hp chain resolve <file> [--index K] [--value V]
       # 解析并打印地址；--value 触发读回校验
+ds3hp chain verify <file> --value V [--pid P]
+      # 解析每条链、读值，只保留等于 V 的（无需目标地址，重启后使用）
 ds3hp chain load   <file> [--index K] [--value V]
       # resolve 成功后将地址作为唯一候选写入 .ds3hp_state，供 list/lock 使用
 ds3hp chain clear  <file>
@@ -258,3 +260,7 @@ g = 加载已保存链并绑定地址
 补充（同日）：TUI 退出时把 Watch 列表（名称/类型/锁值/锁定状态）保存到 `.ds3hp_watches`，启动时恢复，并对 `scans>=2` 且收敛的链**自动解析绑定地址**。因此重启游戏后只要链已 stable，打开 TUI 即自动恢复地址与锁定；未 stable 的仍显示 `restored`，需重新追地址后按 `C`。`.ds3hp_watches` 已加入 `.gitignore`。
 
 补充（同日）：按 `a` 新建 Watch 时，若存在同名的 `chains/<name>.chain`，会自动载入：已 `stable` 则直接解析绑定地址；未验证（`scans<2`）则只显示 `chain: N cand (unverified, press C)` 且不绑定。`G` 仍可手动强制解析。
+
+补充（同日）：TUI 启动恢复 Watch 列表后，对每个 Watch 统一调用同一载入逻辑——**始终载入链文件**，仅当 `scans>=2` 时才自动解析绑定；未验证的显示候选数（CHAIN 列 `Nc`）。
+
+补充（同日，值验证）：新增 `chain verify <file> --value V`（TUI 按 `V`）。对每条候选链解析、读取值，只保留等于 V 的——**无需目标地址、无需重扫**，重启后即可裁剪。CLI/TUI 均拒绝在同一进程内 verify（此时所有链本就都指向目标，无信息量），不递增 `verifies`；裁剪到 0 时**不写盘**，避免误输入清空。稳定判定改为 `(scans>=2 || verifies>=1) && n==1`——即一次跨重启的值验证即可判定 stable 并自动绑定。链文件格式加 `verifies` 字段，版本升到 3。

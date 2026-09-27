@@ -770,7 +770,7 @@ static void cmd_reset(void)
 /* ======================= pointer chains ======================= */
 
 #define CHAIN_MAGIC "DS3CHAIN"
-#define CHAIN_VERSION 2
+#define CHAIN_VERSION 3
 #define CHAIN_MAX 8
 #define CHAIN_MAX_OFF (1u << 20)
 #define CHAIN_MAX_PROBES 8000000u
@@ -786,6 +786,7 @@ typedef struct {
     int type;
     char module[256];
     uint32_t scans;
+    uint32_t verifies;
     uint64_t token;
     Chain *c;
     uint32_t n, cap;
@@ -944,6 +945,50 @@ static uint64_t chain_total_off(const Chain *c)
     for (int i = 0; i < c->n; i++)
         t += c->offs[i];
     return t;
+}
+
+static int chain_is_stable(const ChainSet *cs)
+{
+    return (cs->scans >= 2 || cs->verifies >= 1) && cs->n == 1;
+}
+
+/* keep only chains whose resolved value equals val; returns survivors or -1 */
+static int chain_verify(ChainSet *cs, int pid, double val)
+{
+    if (cs->n == 0)
+        return 0;
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(pid, &m, &nm) != 0) {
+        fprintf(stderr, "error: open maps\n");
+        return -1;
+    }
+    uint64_t modbase = chain_module_base(m, nm, cs->module);
+    if (!modbase) {
+        const char *base = strrchr(cs->module, '/');
+        base = base ? base + 1 : cs->module;
+        modbase = chain_module_base(m, nm, base);
+    }
+    if (!modbase) {
+        fprintf(stderr, "error: module '%s' not mapped now\n", cs->module);
+        free(m);
+        return -1;
+    }
+    uint32_t want = val_to_bits(cs->type, val);
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < cs->n; i++) {
+        uint64_t addr;
+        if (!chain_resolve(g_pid, m, nm, modbase, &cs->c[i], &addr))
+            continue;
+        int ok;
+        uint32_t v = read_at(addr, &ok);
+        if (ok && v == want)
+            cs->c[out++] = cs->c[i];
+    }
+    free(m);
+    cs->n = out;
+    cs->verifies++;
+    return (int)out;
 }
 
 static void chain_format(const Chain *c, const char *mod, char *buf, size_t len)
@@ -1234,6 +1279,7 @@ static int chainset_save(const char *file, const ChainSet *cs)
     }
     uint32_t ver = CHAIN_VERSION;
     uint32_t scans = cs->scans;
+    uint32_t verifies = cs->verifies;
     int32_t type = cs->type;
     uint64_t token = cs->token;
     uint16_t ml = (uint16_t)strlen(cs->module);
@@ -1241,6 +1287,7 @@ static int chainset_save(const char *file, const ChainSet *cs)
     fwrite(CHAIN_MAGIC, 1, 8, f);
     fwrite(&ver, 4, 1, f);
     fwrite(&scans, 4, 1, f);
+    fwrite(&verifies, 4, 1, f);
     fwrite(&type, 4, 1, f);
     fwrite(&token, 8, 1, f);
     fwrite(&ml, 2, 1, f);
@@ -1263,7 +1310,7 @@ static int chainset_load(const char *file, ChainSet *cs)
     if (!f)
         return -1;
     char magic[8];
-    uint32_t ver = 0, scans = 0, cnt = 0;
+    uint32_t ver = 0, scans = 0, verifies = 0, cnt = 0;
     int32_t type = 0;
     uint64_t token = 0;
     uint16_t ml = 0;
@@ -1272,8 +1319,8 @@ static int chainset_load(const char *file, ChainSet *cs)
         ok = 0;
     if (ok && (fread(&ver, 4, 1, f) != 1 || ver != CHAIN_VERSION))
         ok = 0;
-    if (ok && (fread(&scans, 4, 1, f) != 1 || fread(&type, 4, 1, f) != 1 ||
-               fread(&token, 8, 1, f) != 1))
+    if (ok && (fread(&scans, 4, 1, f) != 1 || fread(&verifies, 4, 1, f) != 1 ||
+               fread(&type, 4, 1, f) != 1 || fread(&token, 8, 1, f) != 1))
         ok = 0;
     if (ok && (fread(&ml, 2, 1, f) != 1 || ml >= sizeof cs->module))
         ok = 0;
@@ -1297,6 +1344,7 @@ static int chainset_load(const char *file, ChainSet *cs)
     cs->cap = cnt ? cnt : 1;
     cs->n = 0;
     cs->scans = scans;
+    cs->verifies = verifies;
     cs->type = type;
     cs->token = token;
     for (uint32_t i = 0; i < cnt; i++) {
@@ -1342,6 +1390,7 @@ static int chainset_intersect(ChainSet *a, ChainSet *b, ChainSet *out)
     out->type = a->type;
     snprintf(out->module, sizeof out->module, "%s", a->module);
     out->scans = a->scans + 1;
+    out->verifies = a->verifies;
     for (uint32_t i = 0; i < a->n; i++)
         if (cs_contains(b, &a->c[i]))
             cs_push(out, &a->c[i]);
@@ -1462,14 +1511,17 @@ static int cmd_chain_scan(int argc, char **argv)
         free(result.c);
         return 1;
     }
-    printf("wrote %s (%u chain(s), %u scan(s))\n", file, result.n, result.scans);
-    if (result.scans >= 2 && result.n == 1) {
+    printf("wrote %s (%u chain(s), %u scan(s), %u verify/ies)\n", file, result.n,
+           result.scans, result.verifies);
+    if (chain_is_stable(&result)) {
         char b[512];
         chain_format(&result.c[0], result.module, b, sizeof b);
         printf("stable chain: %s\n", b);
         printf("use: ds3hp chain load %s\n", file);
+    } else if (result.n > 1) {
+        printf("still %u candidate(s); re-run after a restart, or use"
+               " 'chain verify <file> --value V'\n", result.n);
     }
-    printf("re-run after restarting the game, with the new target address, to refine\n");
     free(result.c);
     free(fresh.c);
     return 0;
@@ -1666,6 +1718,69 @@ static void cmd_chain_load(int argc, char **argv)
     free(cs.c);
 }
 
+static void cmd_chain_verify(int argc, char **argv)
+{
+    const char *file = NULL;
+    int pid = 0, have_val = 0;
+    double val = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
+            val = atof(argv[++i]);
+            have_val = 1;
+        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+            pid = atoi(argv[++i]);
+        } else if (!file) {
+            file = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown option %s\n", argv[i]);
+            exit(1);
+        }
+    }
+    if (!file || !have_val) {
+        fprintf(stderr, "error: chain verify <file> --value V [--pid P]\n");
+        exit(1);
+    }
+    ChainSet cs = chain_load_file(file);
+    g_pid = pid ? pid : detect_pid();
+    if (!g_pid) {
+        fprintf(stderr, "error: Dark Souls III process not found\n");
+        exit(1);
+    }
+    if (cs.token != 0 && cs.token == process_token(g_pid)) {
+        fprintf(stderr, "same process as last scan; restart the game before verifying"
+                        " (verify needs a new layout to filter)\n");
+        free(cs.c);
+        return;
+    }
+    uint32_t before = cs.n;
+    int r = chain_verify(&cs, g_pid, val);
+    if (r < 0) {
+        free(cs.c);
+        exit(1);
+    }
+    if (cs.n == 0) {
+        fprintf(stderr, "no chain matched %g; %u candidate(s) kept (not saved)\n",
+                val, before);
+        free(cs.c);
+        return;
+    }
+    if (chainset_save(file, &cs) != 0) {
+        free(cs.c);
+        exit(1);
+    }
+    printf("verify: %u -> %u chain(s) against %g (%u verify/ies)\n", before, cs.n,
+           val, cs.verifies);
+    if (chain_is_stable(&cs)) {
+        char b[512];
+        chain_format(&cs.c[0], cs.module, b, sizeof b);
+        printf("stable chain: %s\n", b);
+        printf("use: ds3hp chain load %s\n", file);
+    } else {
+        printf("still %u candidate(s); repeat with another value or restart\n", cs.n);
+    }
+    free(cs.c);
+}
+
 static void cmd_chain_clear(int argc, char **argv)
 {
     if (argc < 1) {
@@ -1691,6 +1806,8 @@ static void cmd_chain(int argc, char **argv)
         cmd_chain_list(argc - 1, argv + 1);
     else if (strcmp(sub, "resolve") == 0)
         cmd_chain_resolve(argc - 1, argv + 1);
+    else if (strcmp(sub, "verify") == 0)
+        cmd_chain_verify(argc - 1, argv + 1);
     else if (strcmp(sub, "load") == 0)
         cmd_chain_load(argc - 1, argv + 1);
     else if (strcmp(sub, "clear") == 0)
@@ -1797,16 +1914,19 @@ static void *scan_thread(void *p)
             result.scans = 1;
             result.token = tok;
         }
+        int save_ok = 1;
         if (w->has_chain_file)
-            chainset_save(w->chain_file, &result);
+            save_ok = chainset_save(w->chain_file, &result) == 0;
         free(w->cs.c);
         w->cs = result;
         w->has_cs = 1;
-        if (same_proc)
-            snprintf(w->status, sizeof w->status, "restart game first (%u scan)", w->cs.scans);
+        if (!save_ok)
+            snprintf(w->status, sizeof w->status, "SAVE FAILED: %.55s", w->chain_file);
+        else if (same_proc)
+            snprintf(w->status, sizeof w->status, "no new scan; restart game [saved]");
         else
-            snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s)", w->cs.n,
-                     w->cs.scans, w->cs.scans == 1 ? "" : "s");
+            snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s) -> %.55s",
+                     w->cs.n, w->cs.scans, w->cs.scans == 1 ? "" : "s", w->chain_file);
         free(fresh.c);
     } else {
         search_filter(&w->s, a->mode, a->param, a->tol, &w->cancel);
@@ -1979,12 +2099,12 @@ static void tui_edit_val(Watch *w)
     if (!w->has_addr)
         return;
     char v[32];
-    if (!tui_prompt("value: ", v, sizeof v) || !v[0])
+    if (!tui_prompt("lock value (not written): ", v, sizeof v) || !v[0])
         return;
     w->lock_bits = val_to_bits(w->s.type, atof(v));
     w->has_lockval = 1;
-    watch_write(w);
-    snprintf(w->status, sizeof w->status, "set once");
+    snprintf(w->status, sizeof w->status, "lock val = %g (press s to write, l to hold)",
+             atof(v));
 }
 
 static void tui_set(Watch *w)
@@ -2030,33 +2150,26 @@ static void tui_chain_path(Watch *w)
     w->has_chain_file = 1;
 }
 
-/* on 'a': if a chain file for this name exists, load it; auto-bind only if verified */
-static void watch_autoload_chain(Watch *w)
+/* resolve the first (best) chain in w->cs and bind it as the watch address */
+static void watch_bind_chain(Watch *w)
 {
-    if (!w->has_chain_file)
-        tui_chain_path(w);
-    ChainSet cs;
-    if (chainset_load(w->chain_file, &cs) != 0)
-        return;
-    free(w->cs.c);
-    w->cs = cs;
-    w->has_cs = 1;
-    if (cs.scans < 2 || cs.n == 0) {
-        snprintf(w->status, sizeof w->status, "chain: %u cand (unverified, press C)", cs.n);
-        return;
-    }
-    if (!g_pid)
+    if (!w->has_cs || w->cs.n == 0 || !g_pid)
         return;
     CMap *m = NULL;
     size_t nm = 0;
     if (cmaps_read(g_pid, &m, &nm) != 0)
         return;
-    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    uint64_t modbase = chain_module_base(m, nm, w->cs.module);
+    if (!modbase) {
+        const char *base = strrchr(w->cs.module, '/');
+        base = base ? base + 1 : w->cs.module;
+        modbase = chain_module_base(m, nm, base);
+    }
     uint64_t addr;
-    int ok = modbase && chain_resolve(g_pid, m, nm, modbase, &cs.c[0], &addr);
+    int ok = modbase && chain_resolve(g_pid, m, nm, modbase, &w->cs.c[0], &addr);
     free(m);
     if (!ok) {
-        snprintf(w->status, sizeof w->status, "chain: %u (resolve failed)", cs.n);
+        snprintf(w->status, sizeof w->status, "chain: %u (resolve failed)", w->cs.n);
         return;
     }
     w->addr = addr;
@@ -2068,6 +2181,70 @@ static void watch_autoload_chain(Watch *w)
             w->has_lockval = 1;
     }
     snprintf(w->status, sizeof w->status, "auto chain -> 0x%llx", (unsigned long long)addr);
+}
+
+/* on 'a': if a chain file for this name exists, load it; auto-bind only if verified */
+static void watch_autoload_chain(Watch *w)
+{
+    if (!w->has_chain_file)
+        tui_chain_path(w);
+    ChainSet cs;
+    if (chainset_load(w->chain_file, &cs) != 0)
+        return;
+    free(w->cs.c);
+    w->cs = cs;
+    w->has_cs = 1;
+    if (!chain_is_stable(&cs)) {
+        if (cs.n == 0)
+            snprintf(w->status, sizeof w->status, "chain file empty");
+        else
+            snprintf(w->status, sizeof w->status,
+                     "chain: %u cand (unverified: press C or V)", cs.n);
+        return;
+    }
+    watch_bind_chain(w);
+}
+
+/* 'V': prune candidate chains by the current value, no address scan needed */
+static void tui_verify_chain(Watch *w)
+{
+    if (w->scanning)
+        return;
+    if (!w->has_cs) {
+        watch_autoload_chain(w);
+        if (!w->has_cs) {
+            snprintf(w->status, sizeof w->status, "no chain file");
+            return;
+        }
+    }
+    if (w->cs.n == 0) {
+        snprintf(w->status, sizeof w->status, "no chains");
+        return;
+    }
+    if (w->cs.token != 0 && w->cs.token == process_token(g_pid)) {
+        snprintf(w->status, sizeof w->status, "restart game to verify (same process)");
+        return;
+    }
+    char v[32];
+    if (!tui_prompt("current value: ", v, sizeof v) || !v[0])
+        return;
+    uint32_t before = w->cs.n;
+    int r = chain_verify(&w->cs, g_pid, atof(v));
+    if (r < 0) {
+        snprintf(w->status, sizeof w->status, "verify failed");
+        return;
+    }
+    if (w->cs.n > 0) {
+        if (w->has_chain_file)
+            chainset_save(w->chain_file, &w->cs);
+        snprintf(w->status, sizeof w->status, "verify: %u -> %u (%u verify%s)",
+                 before, w->cs.n, w->cs.verifies, w->cs.verifies == 1 ? "" : "s");
+        if (chain_is_stable(&w->cs))
+            watch_bind_chain(w);
+    } else {
+        snprintf(w->status, sizeof w->status,
+                 "no chain matched %g; not saved", atof(v));
+    }
 }
 
 static void tui_chain_scan(Watch *w)
@@ -2189,49 +2366,11 @@ static void watches_load(void)
     fclose(f);
 }
 
-/* after a restart, auto-bind any watch whose chain file is verified (scans>=2) */
+/* after restart: load each watch's chain file; auto-bind only if verified */
 static void watches_autoresolve(void)
 {
-    if (!g_pid)
-        return;
-    for (int i = 0; i < g_nw; i++) {
-        Watch *w = &g_w[i];
-        tui_chain_path(w);
-        ChainSet cs;
-        if (chainset_load(w->chain_file, &cs) != 0)
-            continue;
-        if (cs.scans < 2 || cs.n == 0) {
-            free(cs.c);
-            continue;
-        }
-        CMap *m = NULL;
-        size_t nm = 0;
-        if (cmaps_read(g_pid, &m, &nm) != 0) {
-            free(cs.c);
-            continue;
-        }
-        uint64_t modbase = chain_module_base(m, nm, cs.module);
-        uint64_t addr;
-        if (modbase && chain_resolve(g_pid, m, nm, modbase, &cs.c[0], &addr)) {
-            w->addr = addr;
-            w->has_addr = 1;
-            if (!w->has_lockval) {
-                int ok;
-                w->lock_bits = read_at(addr, &ok);
-                if (ok)
-                    w->has_lockval = 1;
-            }
-            free(w->cs.c);
-            w->cs = cs;
-            w->has_cs = 1;
-            snprintf(w->status, sizeof w->status, "auto 0x%llx",
-                     (unsigned long long)addr);
-            free(m);
-            continue;
-        }
-        free(m);
-        free(cs.c);
-    }
+    for (int i = 0; i < g_nw; i++)
+        watch_autoload_chain(&g_w[i]);
 }
 
 static void tui_delete(int idx)
@@ -2382,7 +2521,7 @@ static void tui_draw(void)
             snprintf(lv, sizeof lv, "%g", bits_to_val(w->s.type, w->lock_bits));
         char chn[16] = "-";
         if (w->has_cs) {
-            if (w->cs.scans >= 2 && w->cs.n == 1)
+            if (chain_is_stable(&w->cs))
                 snprintf(chn, sizeof chn, "stable");
             else
                 snprintf(chn, sizeof chn, "%uc", w->cs.n);
@@ -2406,7 +2545,7 @@ static void tui_draw(void)
             mvchgat(2 + i, 0, -1, A_REVERSE, 0, NULL);
     }
     mvprintw(rows - 1, 0,
-             "a add f first d/i dec/inc c/u chg/unch e eq Enter cand l lock v val s set C chain G get x del r reset p pid q quit");
+             "a add f first d/i dec/inc c/u chg/unch e eq Enter cand l lock v lval s once C chain V verify G get x del r reset p pid q quit");
     refresh();
 }
 
@@ -2494,6 +2633,10 @@ static void tui_handle(int ch)
         if (g_nw)
             tui_chain_scan(&g_w[g_cur]);
         break;
+    case 'V':
+        if (g_nw)
+            tui_verify_chain(&g_w[g_cur]);
+        break;
     case 'G':
         if (g_nw)
             tui_load_chain(&g_w[g_cur]);
@@ -2578,6 +2721,7 @@ static void usage(const char *prog)
     printf("        scan for restart-stable pointer chains; re-run after a restart to intersect\n");
     printf("  chain list   <file>       show candidate chains\n");
     printf("  chain resolve <file> [--index K] [--value V]   resolve a chain to an address\n");
+    printf("  chain verify <file> --value V [--pid P]         keep chains whose value == V\n");
     printf("  chain load   <file> [--index K] [--value V]    resolve and load as current target\n");
     printf("  chain clear  <file>       delete a chain file\n");
     printf("  reset                     delete saved scan state\n\n");
