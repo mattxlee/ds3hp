@@ -1873,6 +1873,8 @@ static void watch_start(Watch *w, int mode, double param, double tol)
     w->th_valid = 1;
 }
 
+static void watch_autoload_chain(Watch *w);
+
 static void tui_add_watch(void)
 {
     if (g_nw >= MAX_WATCH) {
@@ -1892,6 +1894,7 @@ static void tui_add_watch(void)
     snprintf(w->status, sizeof w->status, "new");
     g_nw++;
     g_cur = g_nw - 1;
+    watch_autoload_chain(w);
 }
 
 static void tui_first(Watch *w)
@@ -2027,6 +2030,46 @@ static void tui_chain_path(Watch *w)
     w->has_chain_file = 1;
 }
 
+/* on 'a': if a chain file for this name exists, load it; auto-bind only if verified */
+static void watch_autoload_chain(Watch *w)
+{
+    if (!w->has_chain_file)
+        tui_chain_path(w);
+    ChainSet cs;
+    if (chainset_load(w->chain_file, &cs) != 0)
+        return;
+    free(w->cs.c);
+    w->cs = cs;
+    w->has_cs = 1;
+    if (cs.scans < 2 || cs.n == 0) {
+        snprintf(w->status, sizeof w->status, "chain: %u cand (unverified, press C)", cs.n);
+        return;
+    }
+    if (!g_pid)
+        return;
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(g_pid, &m, &nm) != 0)
+        return;
+    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    uint64_t addr;
+    int ok = modbase && chain_resolve(g_pid, m, nm, modbase, &cs.c[0], &addr);
+    free(m);
+    if (!ok) {
+        snprintf(w->status, sizeof w->status, "chain: %u (resolve failed)", cs.n);
+        return;
+    }
+    w->addr = addr;
+    w->has_addr = 1;
+    if (!w->has_lockval) {
+        int o;
+        w->lock_bits = read_at(addr, &o);
+        if (o)
+            w->has_lockval = 1;
+    }
+    snprintf(w->status, sizeof w->status, "auto chain -> 0x%llx", (unsigned long long)addr);
+}
+
 static void tui_chain_scan(Watch *w)
 {
     if (w->scanning)
@@ -2085,6 +2128,110 @@ static void tui_load_chain(Watch *w)
     free(w->cs.c);
     w->cs = cs;
     w->has_cs = 1;
+}
+
+#define WATCH_PATH ".ds3hp_watches"
+
+static void watch_name_sanitize(const char *in, char *out, size_t n)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 1 < n; i++) {
+        char c = in[i];
+        out[j++] = (c == '\t' || c == '\n' || c == '\r') ? '_' : c;
+    }
+    out[j] = 0;
+}
+
+static void watches_save(void)
+{
+    FILE *f = fopen(WATCH_PATH, "w");
+    if (!f)
+        return;
+    fprintf(f, "DS3HPW1\n");
+    for (int i = 0; i < g_nw; i++) {
+        Watch *w = &g_w[i];
+        char nm[32];
+        watch_name_sanitize(w->name, nm, sizeof nm);
+        fprintf(f, "%s\t%d\t%d\t%u\t%d\n", nm, w->s.type, w->has_lockval,
+                w->lock_bits, w->lock_on);
+    }
+    fclose(f);
+}
+
+static void watches_load(void)
+{
+    FILE *f = fopen(WATCH_PATH, "r");
+    if (!f)
+        return;
+    char line[256];
+    if (!fgets(line, sizeof line, f) || strncmp(line, "DS3HPW1", 7) != 0) {
+        fclose(f);
+        return;
+    }
+    while (g_nw < MAX_WATCH && fgets(line, sizeof line, f)) {
+        char nm[24];
+        int type = 0, hl = 0, lo = 0;
+        unsigned bits = 0;
+        if (sscanf(line, "%23[^\t]\t%d\t%d\t%u\t%d", nm, &type, &hl, &bits, &lo) != 5)
+            continue;
+        Watch *w = &g_w[g_nw];
+        memset(w, 0, sizeof *w);
+        snprintf(w->name, sizeof w->name, "%s", nm);
+        w->s.type = type;
+        w->s.min = 1.0;
+        w->s.max = 10000.0;
+        w->has_lockval = hl;
+        w->lock_bits = bits;
+        w->lock_on = lo;
+        snprintf(w->status, sizeof w->status, "restored");
+        g_nw++;
+    }
+    fclose(f);
+}
+
+/* after a restart, auto-bind any watch whose chain file is verified (scans>=2) */
+static void watches_autoresolve(void)
+{
+    if (!g_pid)
+        return;
+    for (int i = 0; i < g_nw; i++) {
+        Watch *w = &g_w[i];
+        tui_chain_path(w);
+        ChainSet cs;
+        if (chainset_load(w->chain_file, &cs) != 0)
+            continue;
+        if (cs.scans < 2 || cs.n == 0) {
+            free(cs.c);
+            continue;
+        }
+        CMap *m = NULL;
+        size_t nm = 0;
+        if (cmaps_read(g_pid, &m, &nm) != 0) {
+            free(cs.c);
+            continue;
+        }
+        uint64_t modbase = chain_module_base(m, nm, cs.module);
+        uint64_t addr;
+        if (modbase && chain_resolve(g_pid, m, nm, modbase, &cs.c[0], &addr)) {
+            w->addr = addr;
+            w->has_addr = 1;
+            if (!w->has_lockval) {
+                int ok;
+                w->lock_bits = read_at(addr, &ok);
+                if (ok)
+                    w->has_lockval = 1;
+            }
+            free(w->cs.c);
+            w->cs = cs;
+            w->has_cs = 1;
+            snprintf(w->status, sizeof w->status, "auto 0x%llx",
+                     (unsigned long long)addr);
+            free(m);
+            continue;
+        }
+        free(m);
+        free(cs.c);
+    }
 }
 
 static void tui_delete(int idx)
@@ -2239,7 +2386,7 @@ static void tui_draw(void)
                 snprintf(chn, sizeof chn, "stable");
             else
                 snprintf(chn, sizeof chn, "%uc", w->cs.n);
-        } else if (w->has_chain_file) {
+        } else if (w->has_chain_file && access(w->chain_file, F_OK) == 0) {
             snprintf(chn, sizeof chn, "file");
         }
         char st[80];
@@ -2371,6 +2518,8 @@ static void cmd_tui(int argc, char **argv)
         g_pid = detect_pid();
     if (!g_pid)
         fprintf(stderr, "warning: Dark Souls III not found; press 'p' to re-detect\n");
+    watches_load();
+    watches_autoresolve();
     initscr();
     cbreak();
     noecho();
@@ -2404,6 +2553,7 @@ static void cmd_tui(int argc, char **argv)
         free(w->s.c);
         free(w->cs.c);
     }
+    watches_save();
     endwin();
     printf("bye\n");
 }

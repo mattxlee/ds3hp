@@ -254,3 +254,7 @@ g = 加载已保存链并绑定地址
 与计划的两处偏差：文件格式新增 `type` 字段；TUI 键位用 `C`/`G` 而非 `c`/`g`。
 
 补充（同日）：链文件新增 `token` 字段（进程标识 = `/proc/pid/stat` 的 starttime 混合 pid）。若再次扫描与上次同一进程，则不递增交集计数、不改变已存集合，并提示"restart game first"；只有真正重启（token 变化）才计入交集。CLI 与 TUI 均已接入。
+
+补充（同日）：TUI 退出时把 Watch 列表（名称/类型/锁值/锁定状态）保存到 `.ds3hp_watches`，启动时恢复，并对 `scans>=2` 且收敛的链**自动解析绑定地址**。因此重启游戏后只要链已 stable，打开 TUI 即自动恢复地址与锁定；未 stable 的仍显示 `restored`，需重新追地址后按 `C`。`.ds3hp_watches` 已加入 `.gitignore`。
+
+补充（同日）：按 `a` 新建 Watch 时，若存在同名的 `chains/<name>.chain`，会自动载入：已 `stable` 则直接解析绑定地址；未验证（`scans<2`）则只显示 `chain: N cand (unverified, press C)` 且不绑定。`G` 仍可手动强制解析。
