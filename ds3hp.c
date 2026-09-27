@@ -966,7 +966,7 @@ static uint64_t chain_total_off(const Chain *c)
 
 static int chain_is_stable(const ChainSet *cs)
 {
-    return (cs->scans >= 2 || cs->verifies >= 1) && cs->n == 1;
+    return cs->n == 1;
 }
 
 /* keep only chains whose resolved value equals val; returns survivors or -1 */
@@ -2149,8 +2149,8 @@ static void cmd_chain_resolve(int argc, char **argv)
         exit(1);
     }
     ChainSet *cs = &e->cs;
-    if (cs->scans < 2 && cs->verifies < 1)
-        fprintf(stderr, "warning: chain not yet verified across restarts\n");
+    if (!chain_is_stable(cs))
+        fprintf(stderr, "warning: %u candidate chain(s); not unique yet\n", cs->n);
     if (index < 0 || (uint32_t)index >= cs->n) {
         fprintf(stderr, "error: index %d out of range (0..%d)\n", index,
                 cs->n ? (int)cs->n - 1 : 0);
@@ -2320,8 +2320,8 @@ static void cmd_chain_load(int argc, char **argv)
         exit(1);
     }
     ChainSet *cs = &e->cs;
-    if (cs->scans < 2 && cs->verifies < 1)
-        fprintf(stderr, "warning: chain not yet verified across restarts\n");
+    if (!chain_is_stable(cs))
+        fprintf(stderr, "warning: %u candidate chain(s); not unique yet\n", cs->n);
     if (index < 0 || (uint32_t)index >= cs->n) {
         fprintf(stderr, "error: index %d out of range (0..%d)\n", index,
                 cs->n ? (int)cs->n - 1 : 0);
@@ -2525,6 +2525,7 @@ static void set_notice(const char *s)
 }
 
 static int watches_save(void);
+static void watch_bind_chain(Watch *w);
 
 static void *scan_thread(void *p)
 {
@@ -2581,6 +2582,8 @@ static void *scan_thread(void *p)
             snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s) [saved]",
                      w->cs.n, w->cs.scans, w->cs.scans == 1 ? "" : "s");
         free(fresh.c);
+        if (chain_is_stable(&w->cs))
+            watch_bind_chain(w);
     } else {
         search_filter(&w->s, a->mode, a->param, a->tol, &w->cancel);
         snprintf(w->status, sizeof w->status, "next: %zu cand", w->s.n);
