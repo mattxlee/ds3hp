@@ -767,11 +767,899 @@ static void cmd_reset(void)
         printf("nothing to clear\n");
 }
 
+/* ======================= pointer chains ======================= */
+
+#define CHAIN_MAGIC "DS3CHAIN"
+#define CHAIN_VERSION 1
+#define CHAIN_MAX 8
+#define CHAIN_MAX_OFF (1u << 20)
+#define CHAIN_MAX_PROBES 8000000u
+#define CHAIN_COUNT_MAX 1000000u
+
+typedef struct {
+    uint64_t rva;
+    uint8_t n;
+    uint64_t offs[CHAIN_MAX];
+} Chain;
+
+typedef struct {
+    int type;
+    char module[256];
+    uint32_t scans;
+    Chain *c;
+    uint32_t n, cap;
+} ChainSet;
+
+typedef struct {
+    uint64_t start, end;
+    char perms[8];
+    char path[1024];
+} CMap;
+
+static int cmaps_read(int pid, CMap **out, size_t *outn)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    CMap *m = NULL;
+    size_t n = 0, cap = 0;
+    char line[2048];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a, b;
+        char perms[8] = {0};
+        char rest[1024] = {0};
+        if (sscanf(line, "%llx-%llx %7s %*s %*s %*s %1023[^\n]", &a, &b, perms, rest) < 3)
+            continue;
+        char *p = rest;
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 256;
+            CMap *nm = realloc(m, cap * sizeof(CMap));
+            if (!nm) {
+                free(m);
+                fclose(f);
+                return -1;
+            }
+            m = nm;
+        }
+        m[n].start = a;
+        m[n].end = b;
+        snprintf(m[n].perms, sizeof m[n].perms, "%s", perms);
+        snprintf(m[n].path, sizeof m[n].path, "%s", p);
+        n++;
+    }
+    fclose(f);
+    *out = m;
+    *outn = n;
+    return 0;
+}
+
+static long cmap_find(const CMap *m, size_t n, uint64_t a)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (a < m[mid].start)
+            hi = mid;
+        else if (a >= m[mid].end)
+            lo = mid + 1;
+        else
+            return (long)mid;
+    }
+    return -1;
+}
+
+static int cmap_readable(const CMap *m, size_t n, uint64_t a)
+{
+    long r = cmap_find(m, n, a);
+    return r >= 0 && m[r].perms[0] == 'r';
+}
+
+static uint64_t chain_module_base(const CMap *m, size_t n, const char *sub)
+{
+    uint64_t base = 0;
+    for (size_t i = 0; i < n; i++)
+        if (m[i].path[0] && strstr(m[i].path, sub) &&
+            (base == 0 || m[i].start < base))
+            base = m[i].start;
+    return base;
+}
+
+static int chain_is_static(const CMap *m, size_t n, uint64_t a, const char *mod)
+{
+    long r = cmap_find(m, n, a);
+    if (r < 0 || !m[r].path[0] || !strstr(m[r].path, mod))
+        return 0;
+    return m[r].perms[0] == 'r' && m[r].perms[1] == 'w';
+}
+
+static int read64_at(int pid, uint64_t addr, uint64_t *out)
+{
+    struct iovec li = { out, 8 };
+    struct iovec ri = { (void *)addr, 8 };
+    return process_vm_readv(pid, &li, 1, &ri, 1, 0) == 8;
+}
+
+static int chain_resolve(int pid, const CMap *m, size_t nm, uint64_t modbase,
+                         const Chain *c, uint64_t *res)
+{
+    uint64_t a = modbase + c->rva;
+    for (int i = 0; i < c->n; i++) {
+        long r = cmap_find(m, nm, a);
+        if (r < 0 || m[r].perms[0] != 'r')
+            return 0;
+        uint64_t p;
+        if (!read64_at(pid, a, &p))
+            return 0;
+        a = p + c->offs[i];
+    }
+    *res = a;
+    return 1;
+}
+
+static uint64_t chain_total_off(const Chain *c)
+{
+    uint64_t t = 0;
+    for (int i = 0; i < c->n; i++)
+        t += c->offs[i];
+    return t;
+}
+
+static void chain_format(const Chain *c, const char *mod, char *buf, size_t len)
+{
+    size_t off = 0;
+    off += snprintf(buf + off, len - off, "%s+0x%llx", mod,
+                    (unsigned long long)c->rva);
+    for (int i = 0; i < c->n && off < len; i++)
+        off += snprintf(buf + off, len - off, " -> 0x%llx",
+                        (unsigned long long)c->offs[i]);
+}
+
+static int chain_id_cmp(const void *A, const void *B)
+{
+    const Chain *a = A, *b = B;
+    if (a->rva != b->rva)
+        return a->rva < b->rva ? -1 : 1;
+    if (a->n != b->n)
+        return a->n < b->n ? -1 : 1;
+    for (int i = 0; i < a->n; i++)
+        if (a->offs[i] != b->offs[i])
+            return a->offs[i] < b->offs[i] ? -1 : 1;
+    return 0;
+}
+
+/* prefer deep chains with small total offset */
+static int chain_heur_cmp(const void *A, const void *B)
+{
+    const Chain *a = A, *b = B;
+    if (a->n != b->n)
+        return a->n > b->n ? -1 : 1;
+    uint64_t ta = chain_total_off(a), tb = chain_total_off(b);
+    if (ta != tb)
+        return ta < tb ? -1 : 1;
+    return chain_id_cmp(A, B);
+}
+
+static void cs_push(ChainSet *cs, const Chain *c)
+{
+    if (cs->n >= CHAIN_COUNT_MAX)
+        return;
+    if (cs->n == cs->cap) {
+        uint32_t nc = cs->cap ? cs->cap * 2 : 64;
+        Chain *p = realloc(cs->c, nc * sizeof(Chain));
+        if (!p)
+            return;
+        cs->c = p;
+        cs->cap = nc;
+    }
+    cs->c[cs->n++] = *c;
+}
+
+static void chainset_unique(ChainSet *cs)
+{
+    if (cs->n < 2)
+        return;
+    qsort(cs->c, cs->n, sizeof(Chain), chain_id_cmp);
+    uint32_t w = 1;
+    for (uint32_t i = 1; i < cs->n; i++)
+        if (chain_id_cmp(&cs->c[i], &cs->c[w - 1]) != 0)
+            cs->c[w++] = cs->c[i];
+    cs->n = w;
+}
+
+/* build one chain by walking probe parents; returns 0 if too deep */
+typedef struct {
+    uint64_t loc, off;
+    int64_t parent;
+} CProbe;
+
+static int cbuild(const CProbe *all, size_t s, uint64_t modbase, Chain *out)
+{
+    uint64_t offs[CHAIN_MAX];
+    int n = 0;
+    int64_t cur = (int64_t)s;
+    while (all[cur].parent >= 0) {
+        if (n >= CHAIN_MAX)
+            return 0;
+        offs[n++] = all[cur].off;
+        cur = all[cur].parent;
+    }
+    out->rva = all[s].loc - modbase;
+    out->n = (uint8_t)n;
+    for (int i = 0; i < n; i++)
+        out->offs[i] = offs[i];
+    return 1;
+}
+
+static CProbe *g_cprobes;
+
+static int cprobe_cmp(const void *pa, const void *pb)
+{
+    uint64_t x = g_cprobes[*(const size_t *)pa].loc;
+    uint64_t y = g_cprobes[*(const size_t *)pb].loc;
+    return (x > y) - (x < y);
+}
+
+static int chain_region_special(const char *path)
+{
+    return path[0] == '[' &&
+           (strncmp(path, "[stack]", 7) == 0 ||
+            strncmp(path, "[vvar]", 6) == 0 ||
+            strncmp(path, "[vdso]", 6) == 0);
+}
+
+static void chain_scan(int pid, uint64_t T, int depth, uint64_t maxoff,
+                       const char *mod, ChainSet *out,
+                       volatile int *cancel, volatile uint64_t *done,
+                       uint64_t *total_out)
+{
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(pid, &m, &nm) != 0) {
+        fprintf(stderr, "error: open maps\n");
+        return;
+    }
+    uint64_t modbase = chain_module_base(m, nm, mod);
+    uint64_t minaddr = UINT64_MAX, maxaddr = 0, total = 0;
+    for (size_t i = 0; i < nm; i++) {
+        if (m[i].perms[0] != 'r' || chain_region_special(m[i].path))
+            continue;
+        if (m[i].start < minaddr)
+            minaddr = m[i].start;
+        if (m[i].end > maxaddr)
+            maxaddr = m[i].end;
+        total += m[i].end - m[i].start;
+    }
+    if (total_out)
+        *total_out = total;
+    if (!modbase) {
+        fprintf(stderr, "error: module '%s' not mapped; use --module SUBSTR\n", mod);
+        free(m);
+        return;
+    }
+
+    CProbe *all = NULL;
+    size_t nall = 0, call = 0;
+    size_t *lvl = NULL, *next = NULL;
+    size_t nlvl = 0, nnext = 0, cnext = 0;
+    uint8_t *buf = NULL;
+    int oom = 0, exhausted = 0;
+
+    all = malloc(256 * sizeof(CProbe));
+    lvl = malloc(sizeof(size_t));
+    buf = malloc(CHUNK);
+    if (!all || !lvl || !buf) {
+        fprintf(stderr, "error: malloc scan\n");
+        free(all);
+        free(lvl);
+        free(buf);
+        free(m);
+        return;
+    }
+    call = 256;
+    all[nall].loc = T;
+    all[nall].off = 0;
+    all[nall].parent = -1;
+    nall = 1;
+    lvl[0] = 0;
+    nlvl = 1;
+
+    for (int d = 1; d <= depth && !(cancel && *cancel) && !exhausted && !oom; d++) {
+        if (nlvl == 0)
+            break;
+        g_cprobes = all;
+        qsort(lvl, nlvl, sizeof(size_t), cprobe_cmp);
+        next = NULL;
+        nnext = 0;
+        cnext = 0;
+        uint64_t scanned = 0;
+        for (size_t ri = 0; ri < nm && !exhausted && !oom; ri++) {
+            if (m[ri].perms[0] != 'r' || chain_region_special(m[ri].path))
+                continue;
+            uint64_t p = m[ri].start;
+            while (p < m[ri].end) {
+                if (cancel && *cancel)
+                    break;
+                size_t want = (size_t)(m[ri].end - p);
+                if (want > CHUNK)
+                    want = CHUNK;
+                struct iovec li = { buf, want };
+                struct iovec rr = { (void *)p, want };
+                ssize_t rd = process_vm_readv(pid, &li, 1, &rr, 1, 0);
+                if (rd <= 0) {
+                    p += 4096 - (p & 4095);
+                    continue;
+                }
+                size_t words = (size_t)rd / 8;
+                for (size_t j = 0; j < words; j++) {
+                    uint64_t W;
+                    memcpy(&W, buf + j * 8, 8);
+                    if (W < minaddr || W >= maxaddr)
+                        continue;
+                    if (!cmap_readable(m, nm, W))
+                        continue;
+                    size_t lo = 0, hi = nlvl;
+                    while (lo < hi) {
+                        size_t mid = (lo + hi) / 2;
+                        if (all[lvl[mid]].loc < W)
+                            lo = mid + 1;
+                        else
+                            hi = mid;
+                    }
+                    if (lo >= nlvl)
+                        continue;
+                    uint64_t A = all[lvl[lo]].loc;
+                    if (A < W)
+                        continue;
+                    uint64_t dd = A - W;
+                    if (dd > maxoff)
+                        continue;
+                    uint64_t loc = p + j * 8;
+                    if (nall == call) {
+                        call = call ? call * 2 : 256;
+                        CProbe *np = realloc(all, call * sizeof(CProbe));
+                        if (!np) {
+                            oom = 1;
+                            break;
+                        }
+                        all = np;
+                    }
+                    g_cprobes = all;
+                    all[nall].loc = loc;
+                    all[nall].off = dd;
+                    all[nall].parent = (int64_t)lvl[lo];
+                    nall++;
+                    if (chain_is_static(m, nm, loc, mod)) {
+                        Chain c;
+                        if (cbuild(all, nall - 1, modbase, &c)) {
+                            uint64_t res;
+                            if (chain_resolve(pid, m, nm, modbase, &c, &res) && res == T)
+                                cs_push(out, &c);
+                        }
+                    } else {
+                        if (nnext == cnext) {
+                            cnext = cnext ? cnext * 2 : 256;
+                            size_t *nn = realloc(next, cnext * sizeof(size_t));
+                            if (!nn) {
+                                oom = 1;
+                                break;
+                            }
+                            next = nn;
+                        }
+                        next[nnext++] = nall - 1;
+                    }
+                    if (nall >= CHAIN_MAX_PROBES) {
+                        exhausted = 1;
+                        break;
+                    }
+                }
+                p += words * 8;
+                if ((size_t)rd < want && words * 8 == (size_t)rd)
+                    p += 8 - (p & 7);
+                scanned = p - m[ri].start;
+                if (done)
+                    *done = scanned;
+                if (exhausted)
+                    break;
+            }
+        }
+        free(lvl);
+        lvl = next;
+        nlvl = nnext;
+        next = NULL;
+    }
+
+    if (exhausted)
+        fprintf(stderr, "  warning: probe limit reached (%u); results may be incomplete\n",
+                CHAIN_MAX_PROBES);
+    if (oom)
+        fprintf(stderr, "  warning: out of memory during scan\n");
+
+    chainset_unique(out);
+    qsort(out->c, out->n, sizeof(Chain), chain_heur_cmp);
+    free(buf);
+    free(all);
+    free(lvl);
+    free(next);
+    free(m);
+}
+
+static int chainset_save(const char *file, const ChainSet *cs)
+{
+    FILE *f = fopen(file, "wb");
+    if (!f) {
+        fprintf(stderr, "error: open %s: %s\n", file, strerror(errno));
+        return -1;
+    }
+    uint32_t ver = CHAIN_VERSION;
+    uint32_t scans = cs->scans;
+    int32_t type = cs->type;
+    uint16_t ml = (uint16_t)strlen(cs->module);
+    uint32_t cnt = cs->n;
+    fwrite(CHAIN_MAGIC, 1, 8, f);
+    fwrite(&ver, 4, 1, f);
+    fwrite(&scans, 4, 1, f);
+    fwrite(&type, 4, 1, f);
+    fwrite(&ml, 2, 1, f);
+    if (ml)
+        fwrite(cs->module, 1, ml, f);
+    fwrite(&cnt, 4, 1, f);
+    for (uint32_t i = 0; i < cs->n; i++) {
+        fwrite(&cs->c[i].rva, 8, 1, f);
+        fwrite(&cs->c[i].n, 1, 1, f);
+        if (cs->c[i].n)
+            fwrite(cs->c[i].offs, 8, cs->c[i].n, f);
+    }
+    fclose(f);
+    return 0;
+}
+
+static int chainset_load(const char *file, ChainSet *cs)
+{
+    FILE *f = fopen(file, "rb");
+    if (!f)
+        return -1;
+    char magic[8];
+    uint32_t ver = 0, scans = 0, cnt = 0;
+    int32_t type = 0;
+    uint16_t ml = 0;
+    int ok = 1;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, CHAIN_MAGIC, 8) != 0)
+        ok = 0;
+    if (ok && (fread(&ver, 4, 1, f) != 1 || ver != CHAIN_VERSION))
+        ok = 0;
+    if (ok && (fread(&scans, 4, 1, f) != 1 || fread(&type, 4, 1, f) != 1))
+        ok = 0;
+    if (ok && (fread(&ml, 2, 1, f) != 1 || ml >= sizeof cs->module))
+        ok = 0;
+    if (ok && ml && fread(cs->module, 1, ml, f) != ml)
+        ok = 0;
+    cs->module[ok ? ml : 0] = 0;
+    if (ok && (fread(&cnt, 4, 1, f) != 1 || cnt > CHAIN_COUNT_MAX))
+        ok = 0;
+    if (!ok) {
+        fclose(f);
+        fprintf(stderr, "error: bad chain file: %s\n", file);
+        return -2;
+    }
+    Chain *arr = calloc(cnt ? cnt : 1, sizeof(Chain));
+    if (!arr) {
+        fclose(f);
+        fprintf(stderr, "error: malloc chain file\n");
+        return -2;
+    }
+    cs->c = arr;
+    cs->cap = cnt ? cnt : 1;
+    cs->n = 0;
+    cs->scans = scans;
+    cs->type = type;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint8_t n;
+        if (fread(&arr[i].rva, 8, 1, f) != 1 || fread(&n, 1, 1, f) != 1 ||
+            n > CHAIN_MAX || (n && fread(arr[i].offs, 8, n, f) != n)) {
+            fclose(f);
+            free(arr);
+            cs->c = NULL;
+            cs->n = 0;
+            cs->cap = 0;
+            fprintf(stderr, "error: bad chain file: %s\n", file);
+            return -2;
+        }
+        arr[i].n = n;
+        cs->n++;
+    }
+    fclose(f);
+    return 0;
+}
+
+static int cs_contains(const ChainSet *cs, const Chain *c)
+{
+    size_t lo = 0, hi = cs->n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        int r = chain_id_cmp(&cs->c[mid], c);
+        if (r == 0)
+            return 1;
+        if (r < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return 0;
+}
+
+/* intersect a (previous scans) with b (current scan); both sorted by id */
+static int chainset_intersect(ChainSet *a, ChainSet *b, ChainSet *out)
+{
+    qsort(a->c, a->n, sizeof(Chain), chain_id_cmp);
+    qsort(b->c, b->n, sizeof(Chain), chain_id_cmp);
+    out->type = a->type;
+    snprintf(out->module, sizeof out->module, "%s", a->module);
+    out->scans = a->scans + 1;
+    for (uint32_t i = 0; i < a->n; i++)
+        if (cs_contains(b, &a->c[i]))
+            cs_push(out, &a->c[i]);
+    chainset_unique(out);
+    qsort(out->c, out->n, sizeof(Chain), chain_heur_cmp);
+    return 0;
+}
+
+static int cmd_chain_scan(int argc, char **argv)
+{
+    const char *file = NULL;
+    const char *mod = "DarkSoulsIII.exe";
+    uint64_t addr = 0;
+    int have_addr = 0, depth = 4, pid = 0, reset = 0, type = T_FLOAT;
+    uint64_t maxoff = 0x1000;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--addr") == 0 && i + 1 < argc) {
+            addr = strtoull(argv[++i], NULL, 0);
+            have_addr = 1;
+        } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
+            depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--max-offset") == 0 && i + 1 < argc) {
+            maxoff = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--module") == 0 && i + 1 < argc) {
+            mod = argv[++i];
+        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+            pid = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
+            const char *t = argv[++i];
+            type = strcmp(t, "int") == 0 ? T_INT : T_FLOAT;
+        } else if (strcmp(argv[i], "--reset") == 0) {
+            reset = 1;
+        } else if (!file) {
+            file = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown option %s\n", argv[i]);
+            return 1;
+        }
+    }
+    if (!file || !have_addr) {
+        fprintf(stderr, "error: chain scan <file> --addr 0xADDR [--depth N] [--max-offset M] [--module S] [--pid P] [--type float|int] [--reset]\n");
+        return 1;
+    }
+    if (depth < 1 || depth > CHAIN_MAX)
+        depth = CHAIN_MAX;
+    if (maxoff > CHAIN_MAX_OFF)
+        maxoff = CHAIN_MAX_OFF;
+    g_pid = pid ? pid : detect_pid();
+    if (!g_pid) {
+        fprintf(stderr, "error: Dark Souls III process not found\n");
+        return 1;
+    }
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(g_pid, &m, &nm) != 0) {
+        fprintf(stderr, "error: open maps\n");
+        return 1;
+    }
+    uint64_t modbase = chain_module_base(m, nm, mod);
+    if (!modbase) {
+        fprintf(stderr, "error: module '%s' not mapped; use --module SUBSTR\n", mod);
+        free(m);
+        return 1;
+    }
+    if (!cmap_readable(m, nm, addr)) {
+        fprintf(stderr, "error: target 0x%llx is not readable\n", (unsigned long long)addr);
+        free(m);
+        return 1;
+    }
+    free(m);
+
+    ChainSet prev;
+    int have_prev = 0;
+    if (!reset) {
+        int r = chainset_load(file, &prev);
+        if (r == 0)
+            have_prev = 1;
+        else if (r == -2)
+            return 1;
+    }
+
+    ChainSet fresh = {0};
+    fresh.type = type;
+    snprintf(fresh.module, sizeof fresh.module, "%s", mod);
+    fprintf(stderr, "pointer scan: target 0x%llx, module %s (base 0x%llx), depth %d, max-offset 0x%llx\n",
+            (unsigned long long)addr, mod, (unsigned long long)modbase, depth,
+            (unsigned long long)maxoff);
+    uint64_t total = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    chain_scan(g_pid, addr, depth, maxoff, mod, &fresh, NULL, NULL, &total);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    printf("scan: %u candidate chain(s) in %.1fs\n", fresh.n, dt);
+
+    ChainSet result = {0};
+    if (have_prev) {
+        chainset_intersect(&prev, &fresh, &result);
+        printf("intersect: %u -> %u chain(s) (scan #%u)\n", prev.n, result.n, result.scans);
+        free(prev.c);
+    } else {
+        result = fresh;
+        result.type = type;
+        snprintf(result.module, sizeof result.module, "%s", mod);
+        result.scans = 1;
+        memset(&fresh, 0, sizeof fresh);
+        printf("saved %u candidate chain(s) (scan #1)\n", result.n);
+        if (result.n == 0)
+            fprintf(stderr, "note: no chain found; increase --depth/--max-offset\n");
+    }
+    if (chainset_save(file, &result) != 0) {
+        free(result.c);
+        return 1;
+    }
+    printf("wrote %s (%u chain(s), %u scan(s))\n", file, result.n, result.scans);
+    if (result.scans >= 2 && result.n == 1) {
+        char b[512];
+        chain_format(&result.c[0], result.module, b, sizeof b);
+        printf("stable chain: %s\n", b);
+        printf("use: ds3hp chain load %s\n", file);
+    }
+    printf("re-run after restarting the game, with the new target address, to refine\n");
+    free(result.c);
+    free(fresh.c);
+    return 0;
+}
+
+static ChainSet chain_load_file(const char *file)
+{
+    ChainSet cs = {0};
+    int r = chainset_load(file, &cs);
+    if (r == -1) {
+        fprintf(stderr, "error: no chain file %s; run 'chain scan' first\n", file);
+        exit(1);
+    }
+    if (r != 0)
+        exit(1);
+    return cs;
+}
+
+static void cmd_chain_list(int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "error: chain list <file>\n");
+        exit(1);
+    }
+    ChainSet cs = chain_load_file(argv[0]);
+    printf("%s: %u chain(s), %u scan(s), module %s, type %s\n", argv[0], cs.n,
+           cs.scans, cs.module, cs.type == T_FLOAT ? "float" : "int");
+    for (uint32_t i = 0; i < cs.n; i++) {
+        char b[512];
+        chain_format(&cs.c[i], cs.module, b, sizeof b);
+        printf("  [%u] %s  (%u deref%s, total 0x%llx)\n", i, b, cs.c[i].n,
+               cs.c[i].n == 1 ? "" : "s", (unsigned long long)chain_total_off(&cs.c[i]));
+    }
+    free(cs.c);
+}
+
+static void cmd_chain_resolve(int argc, char **argv)
+{
+    const char *file = NULL;
+    int index = 0, pid = 0, have_val = 0;
+    double val = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--index") == 0 && i + 1 < argc)
+            index = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+            pid = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
+            val = atof(argv[++i]);
+            have_val = 1;
+        } else if (!file)
+            file = argv[i];
+        else {
+            fprintf(stderr, "error: unknown option %s\n", argv[i]);
+            exit(1);
+        }
+    }
+    if (!file) {
+        fprintf(stderr, "error: chain resolve <file> [--index K] [--pid P] [--value V]\n");
+        exit(1);
+    }
+    ChainSet cs = chain_load_file(file);
+    if (cs.scans < 2)
+        fprintf(stderr, "warning: only %u scan(s); chain not yet verified across restarts\n", cs.scans);
+    if (index < 0 || (uint32_t)index >= cs.n) {
+        fprintf(stderr, "error: index %d out of range (0..%d)\n", index,
+                cs.n ? (int)cs.n - 1 : 0);
+        exit(1);
+    }
+    g_pid = pid ? pid : detect_pid();
+    if (!g_pid) {
+        fprintf(stderr, "error: Dark Souls III process not found\n");
+        exit(1);
+    }
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(g_pid, &m, &nm) != 0) {
+        fprintf(stderr, "error: open maps\n");
+        exit(1);
+    }
+    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    if (!modbase) {
+        const char *base = strrchr(cs.module, '/');
+        base = base ? base + 1 : cs.module;
+        modbase = chain_module_base(m, nm, base);
+    }
+    if (!modbase) {
+        fprintf(stderr, "error: module '%s' not mapped now\n", cs.module);
+        exit(1);
+    }
+    uint64_t addr;
+    if (!chain_resolve(g_pid, m, nm, modbase, &cs.c[index], &addr)) {
+        fprintf(stderr, "error: chain %d failed to resolve\n", index);
+        exit(1);
+    }
+    char b[512];
+    chain_format(&cs.c[index], cs.module, b, sizeof b);
+    printf("%s\n  resolves to 0x%llx (pid %d, module base 0x%llx)\n", b,
+           (unsigned long long)addr, g_pid, (unsigned long long)modbase);
+    if (have_val) {
+        int ok;
+        uint32_t v = read_at(addr, &ok);
+        uint32_t want = val_to_bits(cs.type, val);
+        if (!ok)
+            printf("  warning: value unreadable at address\n");
+        else if (v != want)
+            printf("  warning: value %g != expected %g (address may be wrong)\n",
+                   bits_to_val(cs.type, v), val);
+        else
+            printf("  value check ok: %g\n", val);
+    }
+    free(m);
+    free(cs.c);
+}
+
+static void cmd_chain_load(int argc, char **argv)
+{
+    const char *file = NULL;
+    int index = 0, pid = 0, have_val = 0;
+    double val = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--index") == 0 && i + 1 < argc)
+            index = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+            pid = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
+            val = atof(argv[++i]);
+            have_val = 1;
+        } else if (!file)
+            file = argv[i];
+        else {
+            fprintf(stderr, "error: unknown option %s\n", argv[i]);
+            exit(1);
+        }
+    }
+    if (!file) {
+        fprintf(stderr, "error: chain load <file> [--index K] [--pid P] [--value V]\n");
+        exit(1);
+    }
+    ChainSet cs = chain_load_file(file);
+    if (cs.scans < 2)
+        fprintf(stderr, "warning: only %u scan(s); chain not yet verified across restarts\n", cs.scans);
+    if (index < 0 || (uint32_t)index >= cs.n) {
+        fprintf(stderr, "error: index %d out of range (0..%d)\n", index,
+                cs.n ? (int)cs.n - 1 : 0);
+        exit(1);
+    }
+    g_pid = pid ? pid : detect_pid();
+    if (!g_pid) {
+        fprintf(stderr, "error: Dark Souls III process not found\n");
+        exit(1);
+    }
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(g_pid, &m, &nm) != 0) {
+        fprintf(stderr, "error: open maps\n");
+        exit(1);
+    }
+    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    uint64_t addr;
+    if (!modbase || !chain_resolve(g_pid, m, nm, modbase, &cs.c[index], &addr)) {
+        fprintf(stderr, "error: chain %d failed to resolve (module %s)\n", index, cs.module);
+        exit(1);
+    }
+    int ok;
+    uint32_t cur = read_at(addr, &ok);
+    if (!ok) {
+        fprintf(stderr, "error: resolved address 0x%llx is unreadable\n",
+                (unsigned long long)addr);
+        exit(1);
+    }
+    if (have_val) {
+        uint32_t want = val_to_bits(cs.type, val);
+        if (cur != want)
+            printf("warning: current value %g != expected %g\n",
+                   bits_to_val(cs.type, cur), val);
+    }
+    g_s.type = cs.type;
+    g_s.min = 1.0;
+    g_s.max = 10000.0;
+    g_s.exact = 0;
+    g_s.tol = 0;
+    Cand c = { addr, cur };
+    g_s.c = &c;
+    g_s.n = 1;
+    g_s.cap = 1;
+    save_state();
+    g_s.c = NULL;
+    g_s.n = 0;
+    g_s.cap = 0;
+    printf("loaded chain %d -> 0x%llx = %g (pid %d)\n", index,
+           (unsigned long long)addr, bits_to_val(cs.type, cur), g_pid);
+    printf("run 'ds3hp list' or 'ds3hp lock 0' to use it\n");
+    free(m);
+    free(cs.c);
+}
+
+static void cmd_chain_clear(int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "error: chain clear <file>\n");
+        exit(1);
+    }
+    if (unlink(argv[0]) == 0)
+        printf("removed %s\n", argv[0]);
+    else
+        printf("nothing to remove (%s)\n", argv[0]);
+}
+
+static void cmd_chain(int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "usage: chain <scan|list|resolve|load|clear> ...\n");
+        exit(1);
+    }
+    const char *sub = argv[0];
+    if (strcmp(sub, "scan") == 0)
+        cmd_chain_scan(argc - 1, argv + 1);
+    else if (strcmp(sub, "list") == 0)
+        cmd_chain_list(argc - 1, argv + 1);
+    else if (strcmp(sub, "resolve") == 0)
+        cmd_chain_resolve(argc - 1, argv + 1);
+    else if (strcmp(sub, "load") == 0)
+        cmd_chain_load(argc - 1, argv + 1);
+    else if (strcmp(sub, "clear") == 0)
+        cmd_chain_clear(argc - 1, argv + 1);
+    else {
+        fprintf(stderr, "error: unknown chain subcommand '%s'\n", sub);
+        exit(1);
+    }
+}
+
 /* ============================ TUI ============================ */
 
 #define MAX_WATCH 64
 #define TICK_MS 20
 #define SCAN_FIRST (-1)
+#define SCAN_CHAIN (-2)
+#define CHAIN_DEF_DEPTH 4
+#define CHAIN_DEF_OFF 0x1000
 
 typedef struct {
     char name[24];
@@ -785,11 +1673,16 @@ typedef struct {
     volatile int cancel;
     volatile uint64_t progress;
     uint64_t total;
+    int scan_mode;
     pthread_t th;
     int th_valid;
-    char status[64];
+    char status[80];
     int live_ok;
     uint32_t live_bits;
+    char chain_file[256];
+    int has_chain_file;
+    ChainSet cs;
+    int has_cs;
 } Watch;
 
 static Watch g_w[MAX_WATCH];
@@ -822,6 +1715,38 @@ static void *scan_thread(void *p)
         scan_all(&ctx, 1);
         w->total = ctx.total;
         snprintf(w->status, sizeof w->status, "first: %zu cand", w->s.n);
+    } else if (a->mode == SCAN_CHAIN) {
+        ChainSet fresh = {0};
+        fresh.type = w->s.type;
+        snprintf(fresh.module, sizeof fresh.module, "%s", "DarkSoulsIII.exe");
+        uint64_t total = 0;
+        w->progress = 0;
+        chain_scan(g_pid, w->addr, CHAIN_DEF_DEPTH, CHAIN_DEF_OFF, "DarkSoulsIII.exe",
+                   &fresh, &w->cancel, &w->progress, &total);
+        w->total = total;
+        ChainSet result = {0};
+        ChainSet prev;
+        if (w->has_chain_file && access(w->chain_file, F_OK) == 0 &&
+            chainset_load(w->chain_file, &prev) == 0) {
+            chainset_intersect(&prev, &fresh, &result);
+            free(prev.c);
+            free(fresh.c);
+            fresh.c = NULL;
+        } else {
+            result = fresh;
+            memset(&fresh, 0, sizeof fresh);
+            result.type = w->s.type;
+            snprintf(result.module, sizeof result.module, "%s", "DarkSoulsIII.exe");
+            result.scans = 1;
+        }
+        if (w->has_chain_file)
+            chainset_save(w->chain_file, &result);
+        free(w->cs.c);
+        w->cs = result;
+        w->has_cs = 1;
+        snprintf(w->status, sizeof w->status, "chain: %u (%u scan%s)", w->cs.n,
+                 w->cs.scans, w->cs.scans == 1 ? "" : "s");
+        free(fresh.c);
     } else {
         search_filter(&w->s, a->mode, a->param, a->tol, &w->cancel);
         snprintf(w->status, sizeof w->status, "next: %zu cand", w->s.n);
@@ -866,7 +1791,9 @@ static void watch_start(Watch *w, int mode, double param, double tol)
     w->scanning = 1;
     w->progress = 0;
     w->total = 0;
-    snprintf(w->status, sizeof w->status, "%s...", mode == SCAN_FIRST ? "scanning" : "filtering");
+    w->scan_mode = mode;
+    snprintf(w->status, sizeof w->status, "%s...",
+             mode == SCAN_FIRST ? "scanning" : mode == SCAN_CHAIN ? "chain scan" : "filtering");
     ScanArgs *a = malloc(sizeof *a);
     if (!a) {
         w->scanning = 0;
@@ -1025,6 +1952,80 @@ static void tui_reset(Watch *w)
     snprintf(w->status, sizeof w->status, "reset");
 }
 
+static void tui_chain_path(Watch *w)
+{
+    char safe[64];
+    size_t j = 0;
+    for (size_t i = 0; w->name[i] && j < sizeof safe - 1; i++) {
+        unsigned char ch = (unsigned char)w->name[i];
+        safe[j++] = (isalnum(ch) || ch == '_' || ch == '-' || ch == '.') ? (char)ch : '_';
+    }
+    safe[j] = 0;
+    mkdir("chains", 0755);
+    snprintf(w->chain_file, sizeof w->chain_file, "chains/%s.chain", j ? safe : "watch");
+    w->has_chain_file = 1;
+}
+
+static void tui_chain_scan(Watch *w)
+{
+    if (w->scanning)
+        return;
+    if (!w->has_addr) {
+        snprintf(w->status, sizeof w->status, "bind an address first");
+        return;
+    }
+    if (!w->has_chain_file)
+        tui_chain_path(w);
+    watch_start(w, SCAN_CHAIN, 0, 0);
+}
+
+static void tui_load_chain(Watch *w)
+{
+    if (w->scanning)
+        return;
+    if (!w->has_chain_file)
+        tui_chain_path(w);
+    ChainSet cs;
+    int r = chainset_load(w->chain_file, &cs);
+    if (r != 0) {
+        snprintf(w->status, sizeof w->status, "no chain file");
+        return;
+    }
+    if (cs.n == 0) {
+        snprintf(w->status, sizeof w->status, "chain file empty");
+        free(cs.c);
+        return;
+    }
+    CMap *m = NULL;
+    size_t nm = 0;
+    if (cmaps_read(g_pid, &m, &nm) != 0) {
+        snprintf(w->status, sizeof w->status, "open maps failed");
+        free(cs.c);
+        return;
+    }
+    uint64_t modbase = chain_module_base(m, nm, cs.module);
+    uint64_t addr;
+    if (!modbase || !chain_resolve(g_pid, m, nm, modbase, &cs.c[0], &addr)) {
+        snprintf(w->status, sizeof w->status, "chain failed to resolve");
+        free(m);
+        free(cs.c);
+        return;
+    }
+    free(m);
+    w->addr = addr;
+    w->has_addr = 1;
+    if (!w->has_lockval) {
+        int ok;
+        w->lock_bits = read_at(addr, &ok);
+        if (ok)
+            w->has_lockval = 1;
+    }
+    snprintf(w->status, sizeof w->status, "chain -> 0x%llx", (unsigned long long)addr);
+    free(w->cs.c);
+    w->cs = cs;
+    w->has_cs = 1;
+}
+
 static void tui_delete(int idx)
 {
     if (idx < 0 || idx >= g_nw)
@@ -1036,6 +2037,9 @@ static void tui_delete(int idx)
         w->th_valid = 0;
     }
     free(w->s.c);
+    free(w->cs.c);
+    w->s.c = NULL;
+    w->cs.c = NULL;
     memmove(&g_w[idx], &g_w[idx + 1], (g_nw - idx - 1) * sizeof(Watch));
     g_nw--;
     if (g_cur >= g_nw)
@@ -1148,8 +2152,8 @@ static void tui_draw(void)
     attron(A_BOLD);
     mvprintw(0, 0, "ds3hp tui   pid=%d   %d watch(es)", g_pid, g_nw);
     attroff(A_BOLD);
-    mvprintw(1, 0, "%-10s %-5s %-18s %12s %3s %12s  %s",
-             "NAME", "TYPE", "ADDR", "VALUE", "LCK", "LOCKVAL", "STATUS");
+    mvprintw(1, 0, "%-8s %-5s %-16s %10s %3s %10s %-7s %s",
+             "NAME", "TYPE", "ADDR", "VALUE", "LCK", "LOCKVAL", "CHAIN", "STATUS");
     int listrows = rows - 4;
     if (listrows < 1)
         listrows = 1;
@@ -1168,21 +2172,33 @@ static void tui_draw(void)
         char lv[24] = "--";
         if (w->has_lockval)
             snprintf(lv, sizeof lv, "%g", bits_to_val(w->s.type, w->lock_bits));
-        char st[64];
+        char chn[16] = "-";
+        if (w->has_cs) {
+            if (w->cs.scans >= 2 && w->cs.n == 1)
+                snprintf(chn, sizeof chn, "stable");
+            else
+                snprintf(chn, sizeof chn, "%uc", w->cs.n);
+        } else if (w->has_chain_file) {
+            snprintf(chn, sizeof chn, "file");
+        }
+        char st[80];
         if (w->scanning) {
             double pct = w->total ? 100.0 * (double)w->progress / (double)w->total : 0;
-            snprintf(st, sizeof st, "scanning %.0f%% (%zu cand)", pct, w->s.n);
+            if (w->scan_mode == SCAN_CHAIN)
+                snprintf(st, sizeof st, "chain %.0f%%", pct);
+            else
+                snprintf(st, sizeof st, "scanning %.0f%% (%zu cand)", pct, w->s.n);
         } else {
             snprintf(st, sizeof st, "%s", w->status);
         }
-        mvprintw(2 + i, 0, "%-10.10s %-5s %-18.18s %12.12s %3s %12.12s  %-.38s",
+        mvprintw(2 + i, 0, "%-8.8s %-5s %-16.16s %10.10s %3s %10.10s %-7.7s %-.40s",
                  w->name, w->s.type == T_FLOAT ? "float" : "int", addr, val,
-                 w->lock_on ? (w->has_lockval ? "ON" : "?") : "off", lv, st);
+                 w->lock_on ? (w->has_lockval ? "ON" : "?") : "off", lv, chn, st);
         if (i == g_cur)
             mvchgat(2 + i, 0, -1, A_REVERSE, 0, NULL);
     }
     mvprintw(rows - 1, 0,
-             "a add  f first  d/i dec/inc  c/u chg/unch  e eq  Enter cand  l lock  v val  s set  x del  r reset  p pid  q quit");
+             "a add f first d/i dec/inc c/u chg/unch e eq Enter cand l lock v val s set C chain G get x del r reset p pid q quit");
     refresh();
 }
 
@@ -1266,6 +2282,14 @@ static void tui_handle(int ch)
         if (g_nw)
             tui_reset(&g_w[g_cur]);
         break;
+    case 'C':
+        if (g_nw)
+            tui_chain_scan(&g_w[g_cur]);
+        break;
+    case 'G':
+        if (g_nw)
+            tui_load_chain(&g_w[g_cur]);
+        break;
     }
 }
 
@@ -1317,6 +2341,7 @@ static void cmd_tui(int argc, char **argv)
             w->th_valid = 0;
         }
         free(w->s.c);
+        free(w->cs.c);
     }
     endwin();
     printf("bye\n");
@@ -1338,6 +2363,12 @@ static void usage(const char *prog)
     printf("        freeze one or more values at once (defaults to each value now)\n");
     printf("  set   <index|a-b|all> --value V\n");
     printf("        write V once to the chosen candidates\n");
+    printf("  chain scan   <file> --addr 0xADDR [--depth N] [--max-offset M] [--module S] [--pid P] [--type float|int] [--reset]\n");
+    printf("        scan for restart-stable pointer chains; re-run after a restart to intersect\n");
+    printf("  chain list   <file>       show candidate chains\n");
+    printf("  chain resolve <file> [--index K] [--value V]   resolve a chain to an address\n");
+    printf("  chain load   <file> [--index K] [--value V]    resolve and load as current target\n");
+    printf("  chain clear  <file>       delete a chain file\n");
     printf("  reset                     delete saved scan state\n\n");
     printf("typical run (float HP):\n");
     printf("  %s tui               # or use the CLI steps below\n", prog);
@@ -1371,6 +2402,8 @@ int main(int argc, char **argv)
         cmd_lock(argc - 2, argv + 2);
     else if (strcmp(cmd, "set") == 0)
         cmd_set(argc - 2, argv + 2);
+    else if (strcmp(cmd, "chain") == 0)
+        cmd_chain(argc - 2, argv + 2);
     else if (strcmp(cmd, "reset") == 0)
         cmd_reset();
     else if (strcmp(cmd, "pid") == 0) {
