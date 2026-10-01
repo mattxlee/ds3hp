@@ -3217,6 +3217,12 @@ static void tui_refresh_values(void)
         uint32_t v = read_at(w->addr, &ok);
         w->live_bits = v;
         w->live_ok = ok;
+        if (!ok) {
+            /* address no longer maps; drop it and stop writing the lock value */
+            w->has_addr = 0;
+            w->lock_on = 0;
+            snprintf(w->status, sizeof w->status, "address lost; unlocked");
+        }
     }
 }
 
