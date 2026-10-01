@@ -3316,7 +3316,7 @@ static void tui_draw(void)
         }
         const char *cells[8] = {
             w->name, w->s.type == T_FLOAT ? "float" : "int", addr, val,
-            w->lock_on ? (w->has_lockval ? "ON" : "?") : "off", lv, chn, st
+            w->has_addr && w->lock_on ? (w->has_lockval ? "ON" : "?") : "off", lv, chn, st
         };
         tui_trow(4 + i, cells, 8, cw);
         if (i == g_cur)
