@@ -1,0 +1,22 @@
+{
+  "games": {
+    "darksouls3": {
+      "display_name": "Dark Souls III",
+      "process_name": "DarkSoulsIII",
+      "module_name": "DarkSoulsIII.exe",
+      "default_type": "float",
+      "default_min": 1,
+      "default_max": 10000,
+      "default_maps": "anon"
+    },
+    "eldenring": {
+      "display_name": "Elden Ring",
+      "process_name": "eldenring.exe",
+      "module_name": "eldenring.exe",
+      "default_type": "int",
+      "default_min": 1,
+      "default_max": 100000,
+      "default_maps": "anon"
+    }
+  }
+}

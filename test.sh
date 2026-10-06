@@ -54,4 +54,12 @@ if "$bin" chain import-text Bad 'cheat-tool-chain:v1 module="m" type=bogus rva=0
     exit 1
 fi
 
+# The repository config loads and still lists both shipped games.
+cp cheat-tool.json "$XDG_CONFIG_HOME/cheat-tool/cheat-tool.json"
+"$bin" --game eldenring pid >"$tmp/out" 2>&1 || test "$?" -eq 1
+"$bin" --game darksouls3 pid >"$tmp/out" 2>&1 || test "$?" -eq 1
+if grep -q "unknown game profile" "$tmp/out"; then
+    exit 1
+fi
+
 echo "tests passed"
