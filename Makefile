@@ -2,10 +2,13 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -pthread
 LDLIBS ?= -lm -lncursesw
 
-ds3hp: ds3hp.c
+cheat-tool: ds3hp.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
-clean:
-	rm -f ds3hp .ds3hp_state
+test:
+	sh ./test.sh
 
-.PHONY: clean
+clean:
+	rm -f cheat-tool ds3hp
+
+.PHONY: clean test

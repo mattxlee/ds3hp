@@ -1,4 +1,7 @@
+cheat-tool
 ds3hp
+.cheat-tool_state.*
+.test-bin
 .ds3hp_state
 chains/
 .ds3hp_watches

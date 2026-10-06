@@ -18,19 +18,58 @@
 #include <sys/stat.h>
 #include <ncurses.h>
 
-#define STATE_PATH ".ds3hp_state"
-#define MAGIC "DS3HP01"
+#define STATE_MAGIC "CTSTATE"
+#define STATE_VERSION 1
+#define STATE_PATH_MAX 512
 #define CHUNK (1u << 20)
 #define MAX_BATCH 512
 
+typedef enum { JNULL, JBOOL, JNUM, JSTR, JARR, JOBJ } JType;
+typedef struct JVal {
+    JType t;
+    int b;
+    long long num;
+    double dbl;
+    char *str;
+    struct JVal **items;
+    char **keys;
+    size_t n, cap;
+} JVal;
+
+static JVal *json_parse(const char *text, size_t len);
+static void json_free(JVal *v);
+static JVal *jget(const JVal *o, const char *key);
+static const char *jstr(const JVal *v);
+static double jdbl(const JVal *v, double d);
+
 typedef struct {
     char magic[8];
+    uint32_t version;
+    char game_id[64];
     int32_t pid;
     int32_t type;
     double min;
     double max;
     uint64_t count;
 } __attribute__((packed)) StateHdr;
+
+typedef struct {
+    char id[64];
+    char display_name[128];
+    char process_name[64];
+    char module_name[256];
+    int type;
+    double min, max;
+    int anon_only;
+} GameProfile;
+
+static GameProfile g_profile = {
+    "darksouls3", "Dark Souls III", "DarkSoulsIII", "DarkSoulsIII.exe",
+    0, 1.0, 10000.0, 1
+};
+static GameProfile *g_profiles;
+static size_t g_profile_count;
+static char g_state_path[STATE_PATH_MAX];
 
 typedef struct {
     uint64_t addr;
@@ -108,6 +147,154 @@ static uint32_t val_to_bits(int type, double v)
     return b;
 }
 
+static int profile_id_valid(const char *id)
+{
+    if (!id || !id[0] || strlen(id) >= sizeof g_profile.id)
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)id; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+            return 0;
+    return strcmp(id, ".") != 0 && strcmp(id, "..") != 0;
+}
+
+static int process_matches(const char *comm)
+{
+    size_t n = strlen(g_profile.process_name);
+    return comm && n && strncmp(comm, g_profile.process_name, n) == 0;
+}
+
+static void state_path_init(void)
+{
+    int n = snprintf(g_state_path, sizeof g_state_path, ".cheat-tool_state.%s", g_profile.id);
+    if (n < 0 || (size_t)n >= sizeof g_state_path) {
+        fprintf(stderr, "error: profile id too long for state path\n");
+        exit(1);
+    }
+}
+
+static void config_path(char *path, size_t len)
+{
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    int n = xdg && xdg[0]
+        ? snprintf(path, len, "%s/cheat-tool/cheat-tool.json", xdg)
+        : snprintf(path, len, "%s/.config/cheat-tool/cheat-tool.json", home ? home : ".");
+    if (n < 0 || (size_t)n >= len) {
+        fprintf(stderr, "error: config path too long\n");
+        exit(1);
+    }
+}
+
+static int json_has_only_keys(const JVal *obj, const char *const *keys, size_t nkeys)
+{
+    if (!obj || obj->t != JOBJ)
+        return 0;
+    for (size_t i = 0; i < obj->n; i++) {
+        int found = 0;
+        for (size_t j = 0; j < nkeys; j++)
+            if (strcmp(obj->keys[i], keys[j]) == 0)
+                found = 1;
+        if (!found)
+            return 0;
+        for (size_t j = 0; j < i; j++)
+            if (strcmp(obj->keys[i], obj->keys[j]) == 0)
+                return 0;
+    }
+    return 1;
+}
+
+static void profiles_load(void)
+{
+    char path[512];
+    config_path(path, sizeof path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (errno == ENOENT) {
+            g_profiles = malloc(sizeof(GameProfile));
+            if (!g_profiles) die("malloc profiles");
+            g_profiles[0] = g_profile;
+            g_profile_count = 1;
+            return;
+        }
+        fprintf(stderr, "error: open config %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    if (fseek(f, 0, SEEK_END) != 0) die("seek config");
+    long sz = ftell(f);
+    rewind(f);
+    if (sz <= 0 || sz > (1 << 20)) {
+        fclose(f);
+        fprintf(stderr, "error: invalid config size: %s\n", path);
+        exit(1);
+    }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) die("malloc config");
+    size_t nr = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[nr] = 0;
+    JVal *root = json_parse(buf, nr);
+    free(buf);
+    static const char *const root_keys[] = { "games" };
+    static const char *const profile_keys[] = {
+        "display_name", "process_name", "module_name", "default_type",
+        "default_min", "default_max", "default_maps"
+    };
+    JVal *games = jget(root, "games");
+    if (!root || root->t != JOBJ || !json_has_only_keys(root, root_keys, 1) ||
+        !games || games->t != JOBJ || games->n == 0) {
+        json_free(root);
+        fprintf(stderr, "error: invalid config schema in %s\n", path);
+        exit(1);
+    }
+    GameProfile *ps = calloc(games->n, sizeof *ps);
+    if (!ps) die("calloc profiles");
+    size_t np = 0;
+    for (size_t i = 0; i < games->n; i++) {
+        const char *id = games->keys[i];
+        JVal *v = games->items[i];
+        const char *display = jstr(jget(v, "display_name"));
+        const char *process = jstr(jget(v, "process_name"));
+        const char *module = jstr(jget(v, "module_name"));
+        const char *type = jstr(jget(v, "default_type"));
+        const char *maps = jstr(jget(v, "default_maps"));
+        JVal *minv = jget(v, "default_min"), *maxv = jget(v, "default_max");
+        if (!profile_id_valid(id) || !json_has_only_keys(v, profile_keys, 7) || v->n != 7 ||
+            !display || !display[0] || strlen(display) >= sizeof ps[np].display_name ||
+            !process || !process[0] || strlen(process) >= sizeof ps[np].process_name ||
+            !module || !module[0] || strlen(module) >= sizeof ps[np].module_name ||
+            !type || (strcmp(type, "float") != 0 && strcmp(type, "int") != 0) ||
+            !maps || (strcmp(maps, "anon") != 0 && strcmp(maps, "all") != 0) ||
+            !minv || minv->t != JNUM || !maxv || maxv->t != JNUM ||
+            !isfinite(minv->dbl) || !isfinite(maxv->dbl) || minv->dbl >= maxv->dbl) {
+            free(ps);
+            json_free(root);
+            fprintf(stderr, "error: invalid game profile '%s' in %s\n", id, path);
+            exit(1);
+        }
+        snprintf(ps[np].id, sizeof ps[np].id, "%s", id);
+        snprintf(ps[np].display_name, sizeof ps[np].display_name, "%s", display);
+        snprintf(ps[np].process_name, sizeof ps[np].process_name, "%s", process);
+        snprintf(ps[np].module_name, sizeof ps[np].module_name, "%s", module);
+        ps[np].type = strcmp(type, "int") == 0 ? T_INT : T_FLOAT;
+        ps[np].min = minv->dbl;
+        ps[np].max = maxv->dbl;
+        ps[np].anon_only = strcmp(maps, "anon") == 0;
+        np++;
+    }
+    json_free(root);
+    free(g_profiles);
+    g_profiles = ps;
+    g_profile_count = np;
+}
+
+static GameProfile *profile_find(const char *id)
+{
+    for (size_t i = 0; i < g_profile_count; i++)
+        if (strcmp(g_profiles[i].id, id) == 0)
+            return &g_profiles[i];
+    return NULL;
+}
+
 static int detect_pid(void)
 {
     DIR *d = opendir("/proc");
@@ -123,7 +310,7 @@ static int detect_pid(void)
         FILE *f = fopen(path, "r");
         if (!f)
             continue;
-        if (fgets(comm, sizeof comm, f) && strncmp(comm, "DarkSoulsIII", 12) == 0)
+        if (fgets(comm, sizeof comm, f) && process_matches(comm))
             found = atoi(e->d_name);
         fclose(f);
         if (found)
@@ -142,7 +329,7 @@ static int pid_ok(int pid)
     FILE *f = fopen(path, "r");
     if (!f)
         return 0;
-    int ok = fgets(comm, sizeof comm, f) && strncmp(comm, "DarkSoulsIII", 12) == 0;
+    int ok = fgets(comm, sizeof comm, f) && process_matches(comm);
     fclose(f);
     return ok;
 }
@@ -286,11 +473,13 @@ static void scan_all(ScanCtx *ctx, int anon_only)
 
 static void save_state(void)
 {
-    FILE *f = fopen(STATE_PATH, "wb");
+    FILE *f = fopen(g_state_path, "wb");
     if (!f)
         die("write state");
     StateHdr h = {0};
-    memcpy(h.magic, MAGIC, 8);
+    memcpy(h.magic, STATE_MAGIC, sizeof h.magic);
+    h.version = STATE_VERSION;
+    snprintf(h.game_id, sizeof h.game_id, "%s", g_profile.id);
     h.pid = g_pid;
     h.type = g_s.type;
     h.min = g_s.min;
@@ -305,20 +494,38 @@ static void save_state(void)
 
 static void load_state(void)
 {
-    FILE *f = fopen(STATE_PATH, "rb");
+    FILE *f = fopen(g_state_path, "rb");
     if (!f) {
-        fprintf(stderr, "error: no scan state; run 'first' first\n");
+        if (strcmp(g_profile.id, "darksouls3") == 0 && access(".ds3hp_state", F_OK) == 0)
+            fprintf(stderr, "error: legacy .ds3hp_state is unsupported; run 'first' again\n");
+        else
+            fprintf(stderr, "error: no scan state; run 'first' first\n");
         exit(1);
     }
     StateHdr h;
-    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, MAGIC, 8) != 0) {
-        fprintf(stderr, "error: bad state file\n");
+    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, STATE_MAGIC, 8) != 0 ||
+        h.version != STATE_VERSION || strcmp(h.game_id, g_profile.id) != 0) {
+        fclose(f);
+        fprintf(stderr, "error: incompatible scan state; run 'first' for game '%s'\n",
+                g_profile.id);
         exit(1);
     }
     g_pid = h.pid;
     g_s.type = h.type;
     g_s.min = h.min;
     g_s.max = h.max;
+    if (h.count > SIZE_MAX / sizeof(Cand)) {
+        fclose(f);
+        fprintf(stderr, "error: scan state candidate count is invalid\n");
+        exit(1);
+    }
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size != sizeof h + h.count * sizeof(Cand)) {
+        fclose(f);
+        fprintf(stderr, "error: truncated or invalid scan state\n");
+        exit(1);
+    }
     g_s.n = (size_t)h.count;
     g_s.cap = g_s.n ? g_s.n : 1;
     g_s.c = malloc(g_s.cap * sizeof(Cand));
@@ -331,7 +538,10 @@ static void load_state(void)
 
 static void cmd_first(int argc, char **argv)
 {
-    int anon_only = 1;
+    int anon_only = g_profile.anon_only;
+    g_s.type = g_profile.type;
+    g_s.min = g_profile.min;
+    g_s.max = g_profile.max;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             const char *t = argv[++i];
@@ -370,7 +580,7 @@ static void cmd_first(int argc, char **argv)
     if (!g_pid)
         g_pid = detect_pid();
     if (!g_pid) {
-        fprintf(stderr, "error: Dark Souls III process not found (is it running?)\n");
+        fprintf(stderr, "error: %s process not found (is it running?)\n", g_profile.display_name);
         exit(1);
     }
     if (g_s.c) {
@@ -776,7 +986,7 @@ static void cmd_set(int argc, char **argv)
 
 static void cmd_reset(void)
 {
-    if (unlink(STATE_PATH) == 0)
+    if (unlink(g_state_path) == 0)
         printf("state cleared\n");
     else
         printf("nothing to clear\n");
@@ -1288,19 +1498,6 @@ static void chain_scan(int pid, uint64_t T, int depth, uint64_t maxoff,
 
 /* ===================== minimal JSON ===================== */
 
-typedef enum { JNULL, JBOOL, JNUM, JSTR, JARR, JOBJ } JType;
-
-typedef struct JVal {
-    JType t;
-    int b;
-    long long num;
-    double dbl;
-    char *str;
-    struct JVal **items;
-    char **keys;
-    size_t n, cap;
-} JVal;
-
 static void json_free(JVal *v)
 {
     if (!v)
@@ -1614,15 +1811,19 @@ static void jw_str(FILE *f, const char *s)
 
 /* ===================== watch store (JSON) ===================== */
 
+static int legacy_watches_load(void);
 static const char *watches_path(void)
 {
-    static char path[512];
+    static char path[768];
     const char *xdg = getenv("XDG_CONFIG_HOME");
-    if (xdg && xdg[0])
-        snprintf(path, sizeof path, "%s/ds3hp/watches.json", xdg);
-    else {
-        const char *home = getenv("HOME");
-        snprintf(path, sizeof path, "%s/.config/ds3hp/watches.json", home ? home : ".");
+    const char *home = getenv("HOME");
+    int n = xdg && xdg[0]
+        ? snprintf(path, sizeof path, "%s/cheat-tool/games/%s/watches.json", xdg, g_profile.id)
+        : snprintf(path, sizeof path, "%s/.config/cheat-tool/games/%s/watches.json",
+                   home ? home : ".", g_profile.id);
+    if (n < 0 || (size_t)n >= sizeof path) {
+        fprintf(stderr, "error: watch path too long\n");
+        exit(1);
     }
     return path;
 }
@@ -1660,9 +1861,56 @@ static int entries_load(WatchEntry **out, int *outn)
 {
     *out = NULL;
     *outn = 0;
-    FILE *f = fopen(watches_path(), "rb");
-    if (!f)
-        return 0;
+    const char *path = watches_path();
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (errno != ENOENT)
+            return -1;
+        if (strcmp(g_profile.id, "darksouls3") != 0)
+            return 0;
+        struct stat st;
+        if (strcmp(g_profile.id, "darksouls3") == 0 && stat(path, &st) != 0 && errno == ENOENT) {
+            const char *legacy_json = NULL;
+            char legacy_path[512];
+            const char *home = getenv("HOME");
+            int n = snprintf(legacy_path, sizeof legacy_path, "%s/.config/ds3hp/watches.json",
+                             home ? home : ".");
+            if (n >= 0 && (size_t)n < sizeof legacy_path && access(legacy_path, F_OK) == 0)
+                legacy_json = legacy_path;
+            if (legacy_json) {
+                FILE *src = fopen(legacy_json, "rb");
+            if (src) {
+                FILE *dst;
+                char dir[768];
+                snprintf(dir, sizeof dir, "%s", path);
+                char *slash = strrchr(dir, '/');
+                if (slash) { *slash = 0; mkdir_p(dir); }
+                dst = fopen(path, "wb");
+                if (dst) {
+                    char copy[8192];
+                    size_t got;
+                    int ok = 1;
+                    while ((got = fread(copy, 1, sizeof copy, src)) > 0)
+                        if (fwrite(copy, 1, got, dst) != got) { ok = 0; break; }
+                    if (ferror(src)) ok = 0;
+                    fclose(src);
+                    if (fclose(dst) != 0) ok = 0;
+                    if (!ok) {
+                        unlink(path);
+                        fprintf(stderr, "error: failed to migrate legacy watches from %s\n", legacy_json);
+                        return -1;
+                    }
+                    f = fopen(path, "rb");
+                } else {
+                    fclose(src);
+                }
+                }
+            }
+        }
+        if (!f && access(path, F_OK) != 0) {
+            return 0;
+        }
+    }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -1895,10 +2143,10 @@ static void chain_status(const WatchEntry *e, char *buf, size_t len)
 static int cmd_chain_scan(int argc, char **argv)
 {
     const char *name = NULL;
-    const char *mod = "DarkSoulsIII.exe";
+    const char *mod = g_profile.module_name;
     uint64_t addr = 0;
     int have_addr = 0, depth = CHAIN_DEF_DEPTH, pid = 0, reset = 0;
-    int type = -1;
+    int type = g_profile.type;
     uint64_t maxoff = CHAIN_DEF_OFF;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--addr") == 0 && i + 1 < argc) {
@@ -2542,10 +2790,10 @@ static void *scan_thread(void *p)
     } else if (a->mode == SCAN_CHAIN) {
         ChainSet fresh = {0};
         fresh.type = w->s.type;
-        snprintf(fresh.module, sizeof fresh.module, "%s", "DarkSoulsIII.exe");
+        snprintf(fresh.module, sizeof fresh.module, "%s", g_profile.module_name);
         uint64_t total = 0;
         w->progress = 0;
-        chain_scan(g_pid, w->addr, CHAIN_DEF_DEPTH, CHAIN_DEF_OFF, "DarkSoulsIII.exe",
+        chain_scan(g_pid, w->addr, CHAIN_DEF_DEPTH, CHAIN_DEF_OFF, g_profile.module_name,
                    &fresh, &w->cancel, &w->progress, &total);
         w->total = total;
         uint64_t tok = process_token(g_pid);
@@ -2566,7 +2814,7 @@ static void *scan_thread(void *p)
             result = fresh;
             memset(&fresh, 0, sizeof fresh);
             result.type = w->s.type;
-            snprintf(result.module, sizeof result.module, "%s", "DarkSoulsIII.exe");
+            snprintf(result.module, sizeof result.module, "%s", g_profile.module_name);
             result.scans = 1;
             result.token = tok;
             free(w->cs.c);
@@ -2664,9 +2912,9 @@ static void tui_add_watch(void)
     Watch *w = &g_w[g_nw];
     memset(w, 0, sizeof *w);
     snprintf(w->name, sizeof w->name, "%s", name);
-    w->s.type = strcmp(ts, "int") == 0 ? T_INT : T_FLOAT;
-    w->s.min = 1.0;
-    w->s.max = 10000.0;
+    w->s.type = strcmp(ts, "int") == 0 ? T_INT : g_profile.type;
+    w->s.min = g_profile.min;
+    w->s.max = g_profile.max;
     snprintf(w->status, sizeof w->status, "new");
     g_nw++;
     g_cur = g_nw - 1;
@@ -3264,9 +3512,9 @@ static void tui_draw(void)
     (void)cols;
     attron(A_BOLD);
     if (now_ms() < g_notice_until)
-        mvprintw(0, 0, "ds3hp tui   pid=%d   %d watch(es)   [%s]", g_pid, g_nw, g_notice);
+        mvprintw(0, 0, "cheat-tool tui [%s]   pid=%d   %d watch(es)   [%s]", g_profile.id, g_pid, g_nw, g_notice);
     else
-        mvprintw(0, 0, "ds3hp tui   pid=%d   %d watch(es)", g_pid, g_nw);
+        mvprintw(0, 0, "cheat-tool tui [%s]   pid=%d   %d watch(es)", g_profile.id, g_pid, g_nw);
     attroff(A_BOLD);
 
     int cw[8] = { 8, 5, 16, 10, 3, 10, 7, 0 };
@@ -3454,8 +3702,12 @@ static void cmd_tui(int argc, char **argv)
         g_pid = pid_override;
     else if (!g_pid)
         g_pid = detect_pid();
+    if (pid_override && !pid_ok(pid_override)) {
+        fprintf(stderr, "error: pid %d does not match profile '%s'\n", pid_override, g_profile.id);
+        exit(1);
+    }
     if (!g_pid)
-        fprintf(stderr, "warning: Dark Souls III not found; press 'p' to re-detect\n");
+        fprintf(stderr, "warning: game process not found; press 'p' to re-detect\n");
     watches_load();
     watches_autoresolve();
     setlocale(LC_ALL, "");
@@ -3515,7 +3767,8 @@ static void cmd_tui(int argc, char **argv)
 
 static void usage(const char *prog)
 {
-    printf("usage: %s <command> [options]\n\n", prog);
+    printf("usage: %s [--game ID] <command> [options]\n\n", prog);
+    printf("  --game ID                 select game profile (default: darksouls3)\n");
     printf("  tui [--pid N]             interactive multi-target manager (ncurses)\n");
     printf("  first [--type float|int] [--value V [--tol T] | --min A --max B] [--maps anon|all]\n");
     printf("        snapshot HP while at full health, or search an exact value\n");
@@ -3554,23 +3807,45 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 1;
     }
-    const char *cmd = argv[1];
+    profiles_load();
+    const char *game_id = "darksouls3";
+    int cmd_index = 1;
+    if (cmd_index < argc && strcmp(argv[cmd_index], "--game") == 0) {
+        if (cmd_index + 1 >= argc) {
+            fprintf(stderr, "error: --game requires an id\n");
+            return 1;
+        }
+        game_id = argv[cmd_index + 1];
+        cmd_index += 2;
+    }
+    GameProfile *selected = profile_find(game_id);
+    if (!selected) {
+        fprintf(stderr, "error: unknown game profile '%s'\n", game_id);
+        return 1;
+    }
+    g_profile = *selected;
+    state_path_init();
+    if (cmd_index >= argc) {
+        usage(argv[0]);
+        return 1;
+    }
+    const char *cmd = argv[cmd_index];
     if (strcmp(cmd, "tui") == 0)
-        cmd_tui(argc - 2, argv + 2);
+        cmd_tui(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "first") == 0)
-        cmd_first(argc - 2, argv + 2);
+        cmd_first(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "next") == 0)
-        cmd_next(argc - 2, argv + 2);
+        cmd_next(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "list") == 0)
-        cmd_list(argc - 2, argv + 2);
+        cmd_list(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "peek") == 0)
-        cmd_peek(argc - 2, argv + 2);
+        cmd_peek(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "lock") == 0)
-        cmd_lock(argc - 2, argv + 2);
+        cmd_lock(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "set") == 0)
-        cmd_set(argc - 2, argv + 2);
+        cmd_set(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "chain") == 0)
-        cmd_chain(argc - 2, argv + 2);
+        cmd_chain(argc - cmd_index - 1, argv + cmd_index + 1);
     else if (strcmp(cmd, "reset") == 0)
         cmd_reset();
     else if (strcmp(cmd, "pid") == 0) {
