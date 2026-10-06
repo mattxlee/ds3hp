@@ -1950,6 +1950,8 @@ static void jw_str(FILE *f, const char *s)
 /* ===================== watch store (JSON) ===================== */
 
 static int legacy_watches_load(void);
+static int g_legacy_json_checked;
+static int g_legacy_json_found;
 static const char *watches_path(void)
 {
     static char path[768];
@@ -2008,48 +2010,49 @@ static int entries_load(WatchEntry **out, int *outn)
             return -1;
         if (strcmp(g_profile.id, "darksouls3") != 0)
             return 0;
-        struct stat st;
-        if (strcmp(g_profile.id, "darksouls3") == 0 && stat(path, &st) != 0 && errno == ENOENT) {
-            const char *legacy_json = NULL;
-            char legacy_path[512];
-            const char *home = getenv("HOME");
-            int n = snprintf(legacy_path, sizeof legacy_path, "%s/.config/ds3hp/watches.json",
-                             home ? home : ".");
-            if (n >= 0 && (size_t)n < sizeof legacy_path && access(legacy_path, F_OK) == 0)
-                legacy_json = legacy_path;
-            if (legacy_json) {
-                FILE *src = fopen(legacy_json, "rb");
-            if (src) {
-                FILE *dst;
-                char dir[768];
-                snprintf(dir, sizeof dir, "%s", path);
-                char *slash = strrchr(dir, '/');
-                if (slash) { *slash = 0; mkdir_p(dir); }
-                dst = fopen(path, "wb");
-                if (dst) {
-                    char copy[8192];
-                    size_t got;
-                    int ok = 1;
-                    while ((got = fread(copy, 1, sizeof copy, src)) > 0)
-                        if (fwrite(copy, 1, got, dst) != got) { ok = 0; break; }
-                    if (ferror(src)) ok = 0;
-                    fclose(src);
-                    if (fclose(dst) != 0) ok = 0;
-                    if (!ok) {
-                        unlink(path);
-                        fprintf(stderr, "error: failed to migrate legacy watches from %s\n", legacy_json);
-                        return -1;
-                    }
-                    f = fopen(path, "rb");
-                } else {
-                    fclose(src);
-                }
-                }
+
+        const char *xdg = getenv("XDG_CONFIG_HOME");
+        const char *home = getenv("HOME");
+        char legacy_path[768];
+        int n = xdg && xdg[0]
+            ? snprintf(legacy_path, sizeof legacy_path, "%s/ds3hp/watches.json", xdg)
+            : snprintf(legacy_path, sizeof legacy_path, "%s/.config/ds3hp/watches.json",
+                       home ? home : ".");
+        if (n < 0 || (size_t)n >= sizeof legacy_path)
+            return -1;
+
+        g_legacy_json_checked = 1;
+        if (access(legacy_path, F_OK) == 0) {
+            g_legacy_json_found = 1;
+            FILE *src = fopen(legacy_path, "rb");
+            if (!src)
+                return -1;
+            char dir[768];
+            snprintf(dir, sizeof dir, "%s", path);
+            char *slash = strrchr(dir, '/');
+            if (slash) { *slash = 0; mkdir_p(dir); }
+            FILE *dst = fopen(path, "wb");
+            if (!dst) {
+                fclose(src);
+                return -1;
             }
+            char copy[8192];
+            size_t got;
+            int ok = 1;
+            while ((got = fread(copy, 1, sizeof copy, src)) > 0)
+                if (fwrite(copy, 1, got, dst) != got) { ok = 0; break; }
+            if (ferror(src)) ok = 0;
+            fclose(src);
+            if (fclose(dst) != 0) ok = 0;
+            if (!ok) {
+                unlink(path);
+                fprintf(stderr, "error: failed to migrate legacy watches from %s\n", legacy_path);
+                return -1;
+            }
+            f = fopen(path, "rb");
         }
-        if (!f && access(path, F_OK) != 0) {
+        if (!f)
             return 0;
-        }
     }
     return entries_parse_file(path, out, outn);
 }
@@ -2304,7 +2307,7 @@ static int cmd_chain_scan(int argc, char **argv)
     const char *name = NULL;
     const char *mod = g_profile.module_name;
     uint64_t addr = 0;
-    int have_addr = 0, depth = g_profile.chain_depth, pid = 0, reset = 0;
+    int have_addr = 0, depth = g_profile.chain_depth, pid = 0, have_pid = 0, reset = 0;
     int type = g_profile.type;
     uint64_t maxoff = g_profile.chain_max_offset;
     for (int i = 0; i < argc; i++) {
@@ -2319,6 +2322,7 @@ static int cmd_chain_scan(int argc, char **argv)
             mod = argv[++i];
         } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             pid = atoi(argv[++i]);
+            have_pid = 1;
         } else if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
             type = strcmp(argv[++i], "int") == 0 ? T_INT : T_FLOAT;
         } else if (strcmp(argv[i], "--reset") == 0) {
@@ -2340,6 +2344,10 @@ static int cmd_chain_scan(int argc, char **argv)
         depth = CHAIN_MAX;
     if (maxoff > CHAIN_MAX_OFF)
         maxoff = CHAIN_MAX_OFF;
+    if (have_pid && !pid_ok(pid)) {
+        fprintf(stderr, "error: pid %d does not match profile '%s'\n", pid, g_profile.id);
+        return 1;
+    }
     g_pid = pid ? pid : detect_pid();
     if (!g_pid) {
         fprintf(stderr, "error: Dark Souls III process not found\n");
@@ -2434,16 +2442,22 @@ static int cmd_chain_scan(int argc, char **argv)
 static void cmd_chain_list(int argc, char **argv)
 {
     const char *name = NULL;
-    int pid = 0;
+    int pid = 0, have_pid = 0;
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+        if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             pid = atoi(argv[++i]);
+            have_pid = 1;
+        }
         else if (!name)
             name = argv[i];
         else {
             fprintf(stderr, "error: unknown option %s\n", argv[i]);
             exit(1);
         }
+    }
+    if (have_pid && !pid_ok(pid)) {
+        fprintf(stderr, "error: pid %d does not match profile '%s'\n", pid, g_profile.id);
+        exit(1);
     }
     WatchEntry *arr = NULL;
     int n = 0;
@@ -2521,14 +2535,15 @@ static void cmd_chain_list(int argc, char **argv)
 static void cmd_chain_resolve(int argc, char **argv)
 {
     const char *name = NULL;
-    int index = 0, pid = 0, have_val = 0;
+    int index = 0, pid = 0, have_pid = 0, have_val = 0;
     double val = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--index") == 0 && i + 1 < argc)
             index = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             pid = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
+            have_pid = 1;
+        } else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
             val = atof(argv[++i]);
             have_val = 1;
         } else if (!name)
@@ -2540,6 +2555,10 @@ static void cmd_chain_resolve(int argc, char **argv)
     }
     if (!name) {
         fprintf(stderr, "error: chain resolve <watch> [--index K] [--pid P] [--value V]\n");
+        exit(1);
+    }
+    if (have_pid && !pid_ok(pid)) {
+        fprintf(stderr, "error: pid %d does not match profile '%s'\n", pid, g_profile.id);
         exit(1);
     }
     WatchEntry *arr = NULL;
@@ -2614,7 +2633,7 @@ static void cmd_chain_resolve(int argc, char **argv)
 static void cmd_chain_verify(int argc, char **argv)
 {
     const char *name = NULL;
-    int pid = 0, have_val = 0;
+    int pid = 0, have_pid = 0, have_val = 0;
     double val = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
@@ -2622,6 +2641,7 @@ static void cmd_chain_verify(int argc, char **argv)
             have_val = 1;
         } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             pid = atoi(argv[++i]);
+            have_pid = 1;
         } else if (!name)
             name = argv[i];
         else {
@@ -2631,6 +2651,10 @@ static void cmd_chain_verify(int argc, char **argv)
     }
     if (!name || !have_val) {
         fprintf(stderr, "error: chain verify <watch> --value V [--pid P]\n");
+        exit(1);
+    }
+    if (have_pid && !pid_ok(pid)) {
+        fprintf(stderr, "error: pid %d does not match profile '%s'\n", pid, g_profile.id);
         exit(1);
     }
     WatchEntry *arr = NULL;
@@ -2692,13 +2716,15 @@ static void cmd_chain_verify(int argc, char **argv)
 static void cmd_chain_load(int argc, char **argv)
 {
     const char *name = NULL;
-    int index = 0, pid = 0, have_val = 0;
+    int index = 0, pid = 0, have_pid = 0, have_val = 0;
     double val = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--index") == 0 && i + 1 < argc)
             index = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc)
+        else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             pid = atoi(argv[++i]);
+            have_pid = 1;
+        }
         else if (strcmp(argv[i], "--value") == 0 && i + 1 < argc) {
             val = atof(argv[++i]);
             have_val = 1;
@@ -2711,6 +2737,10 @@ static void cmd_chain_load(int argc, char **argv)
     }
     if (!name) {
         fprintf(stderr, "error: chain load <watch> [--index K] [--pid P] [--value V]\n");
+        exit(1);
+    }
+    if (have_pid && !pid_ok(pid)) {
+        fprintf(stderr, "error: pid %d does not match profile '%s'\n", pid, g_profile.id);
         exit(1);
     }
     WatchEntry *arr = NULL;
@@ -3011,7 +3041,7 @@ static void cmd_chain(int argc, char **argv)
     if (argc < 1) {
         fprintf(stderr,
                 "usage: chain <scan|list|resolve|verify|load|import-text|export-text|import|clear|rm> ...\n"
-                "  scan    <watch> --addr 0xADDR [--type float|int] ...\n"
+                "  scan    <watch> --addr 0xADDR [--pid P] [--type float|int] ...\n"
                 "  list    [<watch>] [--pid P]\n"
                 "  resolve <watch> [--index K] [--value V] [--pid P]\n"
                 "  verify  <watch> --value V [--pid P]\n"
@@ -3024,8 +3054,10 @@ static void cmd_chain(int argc, char **argv)
         exit(1);
     }
     const char *sub = argv[0];
-    if (strcmp(sub, "scan") == 0)
-        cmd_chain_scan(argc - 1, argv + 1);
+    if (strcmp(sub, "scan") == 0) {
+        if (cmd_chain_scan(argc - 1, argv + 1) != 0)
+            exit(1);
+    }
     else if (strcmp(sub, "list") == 0)
         cmd_chain_list(argc - 1, argv + 1);
     else if (strcmp(sub, "resolve") == 0)
@@ -3108,6 +3140,19 @@ static void set_notice(const char *s)
 static int watches_save(void);
 static void watch_bind_chain(Watch *w);
 
+static int profile_anon_only(void)
+{
+    return g_profile.anon_only;
+}
+
+static void tui_first_defaults(Search *s)
+{
+    s->exact = 0;
+    s->tol = 0;
+    s->min = g_profile.min;
+    s->max = g_profile.max;
+}
+
 static void *scan_thread(void *p)
 {
     ScanArgs *a = p;
@@ -3117,7 +3162,7 @@ static void *scan_thread(void *p)
         w->progress = 0;
         w->total = 0;
         ScanCtx ctx = { &w->s, &w->cancel, &w->progress, 0, 0, 0 };
-        scan_all(&ctx, 1);
+        scan_all(&ctx, profile_anon_only());
         w->total = ctx.total;
         snprintf(w->status, sizeof w->status, "first: %zu cand", w->s.n);
     } else if (a->mode == SCAN_CHAIN) {
@@ -3297,13 +3342,12 @@ static void tui_first(Watch *w)
 {
     if (w->scanning)
         return;
-    char v[32];
-    if (!tui_prompt("first value (empty=1-10000, A-B range, or V:tol): ", v, sizeof v))
+    char v[32], prompt[128];
+    snprintf(prompt, sizeof prompt, "first value (empty=%g-%g, A-B range, or V:tol): ",
+             g_profile.min, g_profile.max);
+    if (!tui_prompt(prompt, v, sizeof v))
         return;
-    w->s.exact = 0;
-    w->s.tol = 0;
-    w->s.min = 1;
-    w->s.max = 10000;
+    tui_first_defaults(&w->s);
     if (strchr(v, '-')) {
         double a, b;
         if (sscanf(v, "%lf-%lf", &a, &b) == 2) {
@@ -3582,6 +3626,9 @@ static void watches_load(void)
 {
     WatchEntry *arr = NULL;
     int n = 0;
+    const char *path = watches_path();
+    struct stat st;
+    int target_existed = stat(path, &st) == 0;
     if (entries_load(&arr, &n) != 0)
         return;
     for (int i = 0; i < n && g_nw < MAX_WATCH; i++) {
@@ -3604,8 +3651,24 @@ static void watches_load(void)
         g_nw++;
     }
     entries_free(arr, n);
-    if (g_nw == 0 && legacy_watches_load() > 0)
-        watches_save();
+    if (!target_existed && g_nw == 0 && strcmp(g_profile.id, "darksouls3") == 0) {
+        int json_found = g_legacy_json_found;
+        if (!g_legacy_json_checked) {
+            const char *xdg = getenv("XDG_CONFIG_HOME");
+            const char *home = getenv("HOME");
+            char legacy_path[768];
+            int len = xdg && xdg[0]
+                ? snprintf(legacy_path, sizeof legacy_path, "%s/ds3hp/watches.json", xdg)
+                : snprintf(legacy_path, sizeof legacy_path, "%s/.config/ds3hp/watches.json",
+                           home ? home : ".");
+            json_found = len >= 0 && (size_t)len < sizeof legacy_path &&
+                         access(legacy_path, F_OK) == 0;
+        }
+        if (!json_found && legacy_watches_load() > 0) {
+            if (watches_save() != 0)
+                fprintf(stderr, "warning: failed to save imported legacy watches\n");
+        }
+    }
 }
 
 /* after restart: bind verified chains, report the rest */
@@ -4183,7 +4246,7 @@ static void usage(const char *prog)
     printf("  chain list   [<watch>] [--pid P]  list watches, or one watch's chains\n");
     printf("  chain resolve <watch> [--index K] [--value V] [--pid P]   resolve a chain\n");
     printf("  chain verify <watch> --value V [--pid P]        keep chains whose value == V\n");
-    printf("  chain load   <watch> [--index K] [--value V]    resolve and load as current target\n");
+    printf("  chain load   <watch> [--index K] [--value V] [--pid P] resolve and load as current target\n");
     printf("  chain import-text <watch> <chain-line> [--replace] import one shared chain line\n");
     printf("  chain export-text <watch> [--index K]          print one shareable chain line\n");
     printf("  chain import <file> [--replace]            import watches and chains from a JSON file\n");

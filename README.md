@@ -74,7 +74,7 @@ ln -sf "$PWD/cheat-tool.json" ~/.config/cheat-tool/cheat-tool.json
 
 Elden Ring 的 `process_name`/`module_name` 为 Steam/Proton 环境下的实测值（进程名取自 `/proc/<pid>/comm`，模块名取自 `/proc/<pid>/maps`）；默认扫描值可在配置中自行调整。它的结构偏移比 DS3 大（实测出现 `0x7908` 这样的偏移），所以 `chain_max_offset` 需要设为 `32768`（0x8000）才能扫出链，默认的 `0x1000` 会得到 0 条候选。Elden Ring 带 Easy Anti-Cheat，只在离线单人模式使用，联机时不要进行内存操作。
 
-每个游戏配置必须提供 `display_name`、`process_name`、`module_name`、`default_type`（`float` 或 `int`）、`default_min`、`default_max` 和 `default_maps`（`anon` 或 `all`）。可选字段 `chain_depth`（1–8，默认 4）和 `chain_max_offset`（1–1048576，默认 4096）设定该游戏 `chain scan` 的默认参数；命令行 `--depth`/`--max-offset` 仍可单次覆盖。配置采用严格校验：缺少字段、字段类型或取值错误、未知字段、非法 profile ID 均会报错。配置文件存在时它就是权威 profile 列表，若要保留某个游戏必须在该文件中列出。进程名按前缀匹配；未指定 `--pid` 时使用发现的第一个匹配进程。新增游戏时应填写目标环境的实际进程名、模块名及默认扫描值，本工具不猜测这些信息。
+每个游戏配置必须提供 `display_name`、`process_name`、`module_name`、`default_type`（`float` 或 `int`）、`default_min`、`default_max` 和 `default_maps`（`anon` 或 `all`）。CLI 的 `first` 使用这些默认值；TUI 的新 Watch 也采用默认类型与值范围，其空输入的首次扫描使用 profile 的范围和 maps 设置。TUI 中手动输入 `A-B` 范围或 `V[:tol]` 精确值会覆盖范围匹配默认值。可选字段 `chain_depth`（1–8，默认 4）和 `chain_max_offset`（1–1048576，默认 4096）设定该游戏 `chain scan` 的默认参数；命令行 `--depth`/`--max-offset` 仍可单次覆盖。配置采用严格校验：缺少字段、字段类型或取值错误、未知字段、非法 profile ID 均会报错。配置文件存在时它就是权威 profile 列表，若要保留某个游戏必须在该文件中列出。进程名按前缀匹配；未指定 `--pid` 时使用发现的第一个匹配进程。新增游戏时应填写目标环境的实际进程名、模块名及默认扫描值，本工具不猜测这些信息。
 
 用 `--game <id>` 选择配置中的游戏，例如：
 
@@ -117,8 +117,8 @@ first [--type float|int] [--value V [--tol T] | --min A --max B] [--maps anon|al
 - `--type`：数值类型，HP 一般是 `float`；魂/数量类一般是 `int`
 - `--value V`：精确匹配，最快
 - `--tol T`：配合 `--value` 的容差
-- `--min/--max`：范围匹配（默认 `1..10000`）
-- `--maps anon|all`：只扫匿名堆区或全部可读写映射
+- `--min/--max`：范围匹配（默认取所选 profile 的 `default_min/default_max`）
+- `--maps anon|all`：只扫匿名堆区或全部可读写映射（默认取 profile 的 `default_maps`）
 
 ### next 的过滤条件
 
@@ -142,6 +142,8 @@ next <--dec|--inc|--changed|--unchanged|--eq V|--lt V|--gt V> [--tol T]
 - `v` 修改锁值；`s` 写一次；`l` 持续锁定
 - `C` 扫描/交集指针链；`V` 验证；`L` 查看链；`G` 加载/绑定
 - `p` 重新检测进程；`j/k` 移动；`q` 退出并保存 Watch
+
+按 `f` 后留空使用 profile 的 `default_min/default_max` 范围与 `default_maps` 映射策略；输入 `A-B` 会临时指定范围，输入 `V[:tol]` 则按值精确搜索。
 
 进程重启后，TUI 会用所选 profile 重新连接，并尝试解析稳定链。地址失效时会清除过期绑定并停止该地址的锁写入。
 
@@ -203,7 +205,7 @@ $XDG_CONFIG_HOME/cheat-tool/games/<profile-id>/watches.json
 
 扫描状态保存在当前目录的 `.cheat-tool_state.<profile-id>`，包含格式版本和 profile ID；不同游戏状态相互独立。旧格式 `.ds3hp_state` 不迁移，检测到时需重新运行 `first`。
 
-旧 Watch 数据只作为 DS3 数据迁移：旧 `~/.config/ds3hp/watches.json`（若存在）和当前目录 `.ds3hp_watches` 只在新的 DS3 Watch 文件不存在时导入。迁移后保留旧文件；目标已存在时不会覆盖，并提示手动处理。
+旧 Watch 数据只迁移到 DS3，且不删除旧源文件。新的 DS3 Watch JSON 文件不存在时，程序先查找旧 JSON：设置 `XDG_CONFIG_HOME` 时为 `$XDG_CONFIG_HOME/ds3hp/watches.json`，否则为 `$HOME/.config/ds3hp/watches.json`；找到后优先复制并读取该文件。只有旧 JSON 不存在时，TUI 才尝试从当前工作目录的 `.ds3hp_watches` 导入文本 Watch。新目标文件一旦存在（即使为空）即视为权威数据，不会被旧 JSON 或文本文件覆盖，也不会触发文本导入。
 
 ---
 
@@ -228,7 +230,7 @@ cheat-tool [--game ID] pid
 
 ## 8. 注意事项
 
-- 进程检测按 profile 中的 `process_name` 前缀匹配；若多个进程匹配，使用第一个。可通过 `--pid` 指定并校验进程。
+- 进程检测按 profile 中的 `process_name` 前缀匹配；若多个进程匹配，使用第一个。TUI 和 `chain` 命令显式指定的 `--pid` 会按该规则校验是否属于所选 profile。
 - 首次扫描较慢；指针链扫描可能需要数秒到数分钟。
 - `lock`、`set` 和 TUI 写入操作会修改进程内存。仅对自己拥有或获准修改的离线进程使用，并先确认地址正确。
 - 使用 `list`、TUI 实时值列或 `chain resolve --value` 验证目标值。
