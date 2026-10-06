@@ -53,6 +53,11 @@ typedef struct {
     uint64_t count;
 } __attribute__((packed)) StateHdr;
 
+#define CHAIN_MAX 8
+#define CHAIN_DEF_DEPTH 4
+#define CHAIN_DEF_OFF 0x1000
+#define CHAIN_MAX_OFF (1u << 20)
+
 typedef struct {
     char id[64];
     char display_name[128];
@@ -61,11 +66,13 @@ typedef struct {
     int type;
     double min, max;
     int anon_only;
+    int chain_depth;
+    uint64_t chain_max_offset;
 } GameProfile;
 
 static GameProfile g_profile = {
     "darksouls3", "Dark Souls III", "DarkSoulsIII", "DarkSoulsIII.exe",
-    0, 1.0, 10000.0, 1
+    0, 1.0, 10000.0, 1, CHAIN_DEF_DEPTH, CHAIN_DEF_OFF
 };
 static GameProfile *g_profiles;
 static size_t g_profile_count;
@@ -237,7 +244,8 @@ static void profiles_load(void)
     static const char *const root_keys[] = { "games" };
     static const char *const profile_keys[] = {
         "display_name", "process_name", "module_name", "default_type",
-        "default_min", "default_max", "default_maps"
+        "default_min", "default_max", "default_maps",
+        "chain_depth", "chain_max_offset"
     };
     JVal *games = jget(root, "games");
     if (!root || root->t != JOBJ || !json_has_only_keys(root, root_keys, 1) ||
@@ -258,14 +266,20 @@ static void profiles_load(void)
         const char *type = jstr(jget(v, "default_type"));
         const char *maps = jstr(jget(v, "default_maps"));
         JVal *minv = jget(v, "default_min"), *maxv = jget(v, "default_max");
-        if (!profile_id_valid(id) || !json_has_only_keys(v, profile_keys, 7) || v->n != 7 ||
+        JVal *cdv = jget(v, "chain_depth"), *cmv = jget(v, "chain_max_offset");
+        if (!profile_id_valid(id) || !json_has_only_keys(v, profile_keys, 9) ||
+            v->n < 7 || v->n > 9 ||
             !display || !display[0] || strlen(display) >= sizeof ps[np].display_name ||
             !process || !process[0] || strlen(process) >= sizeof ps[np].process_name ||
             !module || !module[0] || strlen(module) >= sizeof ps[np].module_name ||
             !type || (strcmp(type, "float") != 0 && strcmp(type, "int") != 0) ||
             !maps || (strcmp(maps, "anon") != 0 && strcmp(maps, "all") != 0) ||
             !minv || minv->t != JNUM || !maxv || maxv->t != JNUM ||
-            !isfinite(minv->dbl) || !isfinite(maxv->dbl) || minv->dbl >= maxv->dbl) {
+            !isfinite(minv->dbl) || !isfinite(maxv->dbl) || minv->dbl >= maxv->dbl ||
+            (cdv && (cdv->t != JNUM || cdv->dbl < 1 || cdv->dbl > CHAIN_MAX ||
+                     cdv->dbl != (double)(long long)cdv->dbl)) ||
+            (cmv && (cmv->t != JNUM || cmv->dbl < 1 || cmv->dbl > (double)CHAIN_MAX_OFF ||
+                     cmv->dbl != (double)(unsigned long long)cmv->dbl))) {
             free(ps);
             json_free(root);
             fprintf(stderr, "error: invalid game profile '%s' in %s\n", id, path);
@@ -279,6 +293,8 @@ static void profiles_load(void)
         ps[np].min = minv->dbl;
         ps[np].max = maxv->dbl;
         ps[np].anon_only = strcmp(maps, "anon") == 0;
+        ps[np].chain_depth = cdv ? (int)cdv->dbl : CHAIN_DEF_DEPTH;
+        ps[np].chain_max_offset = cmv ? (uint64_t)cmv->dbl : CHAIN_DEF_OFF;
         np++;
     }
     json_free(root);
@@ -996,10 +1012,6 @@ static void cmd_reset(void)
 
 #define CHAIN_MAGIC "DS3CHAIN"
 #define CHAIN_VERSION 3
-#define CHAIN_MAX 8
-#define CHAIN_DEF_DEPTH 4
-#define CHAIN_DEF_OFF 0x1000
-#define CHAIN_MAX_OFF (1u << 20)
 #define CHAIN_MAX_PROBES 8000000u
 #define CHAIN_COUNT_MAX 1000000u
 
@@ -1134,10 +1146,41 @@ static uint64_t process_token(int pid)
     return starttime * 2654435761ull + (uint64_t)(uint32_t)pid;
 }
 
-static int chain_is_static(const CMap *m, size_t n, uint64_t a, const char *mod)
+/* Extent of the mapped module image: the file-backed start plus any adjacent
+ * mapping that continues it. Wine/Proton maps most of a PE image anonymously
+ * after a small file-backed header, so requiring the module name in every
+ * mapping's path would leave only that header page as a valid chain root. */
+static int chain_module_extent(const CMap *m, size_t n, const char *sub,
+                               uint64_t *base_out, uint64_t *end_out)
 {
+    uint64_t base = chain_module_base(m, n, sub);
+    if (!base)
+        return 0;
+    uint64_t end = base;
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (m[i].start < base || m[i].start > end || m[i].end <= end)
+                continue;
+            if (m[i].path[0] && !strstr(m[i].path, sub))
+                continue;   /* belongs to another file */
+            end = m[i].end;
+            changed = 1;
+        }
+    }
+    *base_out = base;
+    *end_out = end;
+    return 1;
+}
+
+static int chain_is_static(const CMap *m, size_t n, uint64_t a,
+                           uint64_t modbase, uint64_t modend)
+{
+    if (a < modbase || a >= modend)
+        return 0;
     long r = cmap_find(m, n, a);
-    if (r < 0 || !m[r].path[0] || !strstr(m[r].path, mod))
+    if (r < 0)
         return 0;
     return m[r].perms[0] == 'r' && m[r].perms[1] == 'w';
 }
@@ -1425,7 +1468,8 @@ static void chain_scan(int pid, uint64_t T, int depth, uint64_t maxoff,
         fprintf(stderr, "error: open maps\n");
         return;
     }
-    uint64_t modbase = chain_module_base(m, nm, mod);
+    uint64_t modbase = 0, modend = 0;
+    chain_module_extent(m, nm, mod, &modbase, &modend);
     uint64_t minaddr = UINT64_MAX, maxaddr = 0, total = 0;
     for (size_t i = 0; i < nm; i++) {
         if (m[i].perms[0] != 'r' || chain_region_special(m[i].path))
@@ -1535,7 +1579,7 @@ static void chain_scan(int pid, uint64_t T, int depth, uint64_t maxoff,
                     all[nall].off = dd;
                     all[nall].parent = (int64_t)lvl[lo];
                     nall++;
-                    if (chain_is_static(m, nm, loc, mod)) {
+                    if (chain_is_static(m, nm, loc, modbase, modend)) {
                         Chain c;
                         if (cbuild(all, nall - 1, modbase, &c)) {
                             uint64_t res;
@@ -2260,9 +2304,9 @@ static int cmd_chain_scan(int argc, char **argv)
     const char *name = NULL;
     const char *mod = g_profile.module_name;
     uint64_t addr = 0;
-    int have_addr = 0, depth = CHAIN_DEF_DEPTH, pid = 0, reset = 0;
+    int have_addr = 0, depth = g_profile.chain_depth, pid = 0, reset = 0;
     int type = g_profile.type;
-    uint64_t maxoff = CHAIN_DEF_OFF;
+    uint64_t maxoff = g_profile.chain_max_offset;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--addr") == 0 && i + 1 < argc) {
             addr = strtoull(argv[++i], NULL, 0);
@@ -3082,7 +3126,8 @@ static void *scan_thread(void *p)
         snprintf(fresh.module, sizeof fresh.module, "%s", g_profile.module_name);
         uint64_t total = 0;
         w->progress = 0;
-        chain_scan(g_pid, w->addr, CHAIN_DEF_DEPTH, CHAIN_DEF_OFF, g_profile.module_name,
+        chain_scan(g_pid, w->addr, g_profile.chain_depth, g_profile.chain_max_offset,
+                   g_profile.module_name,
                    &fresh, &w->cancel, &w->progress, &total);
         w->total = total;
         uint64_t tok = process_token(g_pid);

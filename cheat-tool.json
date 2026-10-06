@@ -16,7 +16,9 @@
       "default_type": "int",
       "default_min": 1,
       "default_max": 100000,
-      "default_maps": "anon"
+      "default_maps": "anon",
+      "chain_depth": 4,
+      "chain_max_offset": 32768
     }
   }
 }

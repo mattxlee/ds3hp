@@ -54,6 +54,22 @@ if "$bin" chain import-text Bad 'cheat-tool-chain:v1 module="m" type=bogus rva=0
     exit 1
 fi
 
+# Optional chain defaults are accepted, and out-of-range values are rejected.
+cat >"$XDG_CONFIG_HOME/cheat-tool/cheat-tool.json" <<'JSON'
+{"games":{"fixture":{"display_name":"Fixture","process_name":"fixture-process","module_name":"fixture.bin","default_type":"int","default_min":0,"default_max":99,"default_maps":"all","chain_depth":2,"chain_max_offset":32768}}}
+JSON
+"$bin" --game fixture pid >"$tmp/out" 2>&1 || test "$?" -eq 1
+if grep -q "invalid game profile" "$tmp/out"; then
+    exit 1
+fi
+cat >"$XDG_CONFIG_HOME/cheat-tool/cheat-tool.json" <<'JSON'
+{"games":{"fixture":{"display_name":"Fixture","process_name":"fixture-process","module_name":"fixture.bin","default_type":"int","default_min":0,"default_max":99,"default_maps":"all","chain_max_offset":99999999}}}
+JSON
+if "$bin" --game fixture pid >"$tmp/out" 2>&1; then
+    exit 1
+fi
+grep -q "invalid game profile" "$tmp/out"
+
 # The repository config loads and still lists both shipped games.
 cp cheat-tool.json "$XDG_CONFIG_HOME/cheat-tool/cheat-tool.json"
 "$bin" --game eldenring pid >"$tmp/out" 2>&1 || test "$?" -eq 1

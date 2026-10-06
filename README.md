@@ -64,15 +64,17 @@ ln -sf "$PWD/cheat-tool.json" ~/.config/cheat-tool/cheat-tool.json
       "default_type": "int",
       "default_min": 1,
       "default_max": 100000,
-      "default_maps": "anon"
+      "default_maps": "anon",
+      "chain_depth": 4,
+      "chain_max_offset": 32768
     }
   }
 }
 ```
 
-Elden Ring 的 `process_name`/`module_name` 为 Steam/Proton 环境下的实测值（进程名取自 `/proc/<pid>/comm`，模块名取自 `/proc/<pid>/maps`）；默认扫描值可在配置中自行调整。Elden Ring 带 Easy Anti-Cheat，只在离线单人模式使用，联机时不要进行内存操作。
+Elden Ring 的 `process_name`/`module_name` 为 Steam/Proton 环境下的实测值（进程名取自 `/proc/<pid>/comm`，模块名取自 `/proc/<pid>/maps`）；默认扫描值可在配置中自行调整。它的结构偏移比 DS3 大（实测出现 `0x7908` 这样的偏移），所以 `chain_max_offset` 需要设为 `32768`（0x8000）才能扫出链，默认的 `0x1000` 会得到 0 条候选。Elden Ring 带 Easy Anti-Cheat，只在离线单人模式使用，联机时不要进行内存操作。
 
-每个游戏配置必须提供 `display_name`、`process_name`、`module_name`、`default_type`（`float` 或 `int`）、`default_min`、`default_max` 和 `default_maps`（`anon` 或 `all`）。配置采用严格校验：缺少字段、字段类型或取值错误、未知字段、非法 profile ID 均会报错。配置文件存在时它就是权威 profile 列表，若要保留某个游戏必须在该文件中列出。进程名按前缀匹配；未指定 `--pid` 时使用发现的第一个匹配进程。新增游戏时应填写目标环境的实际进程名、模块名及默认扫描值，本工具不猜测这些信息。
+每个游戏配置必须提供 `display_name`、`process_name`、`module_name`、`default_type`（`float` 或 `int`）、`default_min`、`default_max` 和 `default_maps`（`anon` 或 `all`）。可选字段 `chain_depth`（1–8，默认 4）和 `chain_max_offset`（1–1048576，默认 4096）设定该游戏 `chain scan` 的默认参数；命令行 `--depth`/`--max-offset` 仍可单次覆盖。配置采用严格校验：缺少字段、字段类型或取值错误、未知字段、非法 profile ID 均会报错。配置文件存在时它就是权威 profile 列表，若要保留某个游戏必须在该文件中列出。进程名按前缀匹配；未指定 `--pid` 时使用发现的第一个匹配进程。新增游戏时应填写目标环境的实际进程名、模块名及默认扫描值，本工具不猜测这些信息。
 
 用 `--game <id>` 选择配置中的游戏，例如：
 
