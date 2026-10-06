@@ -37,4 +37,21 @@ printf 'preserve\n' >"$tmp/.cheat-tool_state.other"
 (cd "$tmp" && "$bin" --game darksouls3 reset >/dev/null)
 test -f "$tmp/.cheat-tool_state.other"
 
+# Shared one-line chain text round-trips through the watch store.
+line='cheat-tool-chain:v1 module="fixture.bin" type=int rva=0x123456 offsets=[0x10,0x20,0x8]'
+"$bin" chain import-text Share "$line" >"$tmp/out"
+"$bin" chain export-text Share >"$tmp/exported"
+grep -Fqx "$line" "$tmp/exported"
+if "$bin" chain import-text Share "$line" >"$tmp/out" 2>&1; then
+    exit 1
+fi
+"$bin" chain import-text Share 'cheat-tool-chain:v1 module="new.bin" type=float rva=0x99 offsets=[0x1]' --replace
+"$bin" chain export-text Share | grep -Fq 'module="new.bin" type=float rva=0x99 offsets=[0x1]'
+if "$bin" chain import-text Bad 'cheat-tool-chain:v2 module="m" type=int rva=0x1 offsets=[0x2]' >"$tmp/out" 2>&1; then
+    exit 1
+fi
+if "$bin" chain import-text Bad 'cheat-tool-chain:v1 module="m" type=bogus rva=0x1 offsets=[0x2]' >"$tmp/out" 2>&1; then
+    exit 1
+fi
+
 echo "tests passed"

@@ -138,6 +138,24 @@ next <--dec|--inc|--changed|--unchanged|--eq V|--lt V|--gt V> [--tol T]
 ./cheat-tool lock 0
 ```
 
+### 分享和导入指针链
+
+可将单条指针链导出为一行文本，便于复制分享：
+
+```sh
+./cheat-tool chain export-text HP
+# 多候选时指定序号
+./cheat-tool chain export-text HP --index 0
+```
+
+格式示例：`cheat-tool-chain:v1 module="DarkSoulsIII.exe" type=float rva=0x123456 offsets=[0x10,0x20,0x8]`。module 是模块文件名，RVA 和 offsets 为十六进制；文本不包含进程 PID 或绝对地址。导入时指定本地 Watch 名称：
+
+```sh
+./cheat-tool chain import-text HP 'cheat-tool-chain:v1 module="DarkSoulsIII.exe" type=float rva=0x123456 offsets=[0x10,0x20,0x8]'
+```
+
+已有同名 Watch 默认报错；加 `--replace` 才替换。TUI 中按 `I`，输入 Watch 名称后粘贴整行链文本（单行）。导入只保存链，不会对进程写内存；若当前进程可解析该模块/RVA，TUI 会尝试绑定地址。
+
 常用管理：
 
 ```sh

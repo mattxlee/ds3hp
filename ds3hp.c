@@ -1227,6 +1227,100 @@ static void chain_format(const Chain *c, const char *mod, char *buf, size_t len)
                         (unsigned long long)c->offs[i]);
 }
 
+static int chain_text_parse(const char *text, Chain *chain, ChainSet *set)
+{
+    char module[sizeof set->module];
+    char type[16], rva_text[32], value[32];
+    const char *p = text;
+    memset(chain, 0, sizeof *chain);
+    memset(set, 0, sizeof *set);
+    if (strncmp(p, "cheat-tool-chain:v1", 19) != 0 ||
+        (p[19] && !isspace((unsigned char)p[19])))
+        return -1;
+    p += 19;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "module=\"", 8) != 0) return -1;
+    p += 8;
+    size_t mn = 0;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p++;
+        if ((unsigned char)*p < 0x20 || mn + 1 >= sizeof module) return -1;
+        module[mn++] = *p++;
+    }
+    if (*p++ != '"' || mn == 0) return -1;
+    module[mn] = 0;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "type=", 5) != 0) return -1;
+    p += 5;
+    size_t tn = 0;
+    while (*p && !isspace((unsigned char)*p)) {
+        if (tn + 1 >= sizeof type) return -1;
+        type[tn++] = *p++;
+    }
+    type[tn] = 0;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "rva=", 4) != 0) return -1;
+    p += 4;
+    size_t rn = 0;
+    while (*p && !isspace((unsigned char)*p)) {
+        if (rn + 1 >= sizeof rva_text) return -1;
+        rva_text[rn++] = *p++;
+    }
+    rva_text[rn] = 0;
+    if (!rn) return -1;
+    errno = 0;
+    char *ep;
+    unsigned long long rva = strtoull(rva_text, &ep, 0);
+    if (errno || !rva_text[0] || *ep) return -1;
+    if (strcmp(type, "float") == 0) set->type = T_FLOAT;
+    else if (strcmp(type, "int") == 0) set->type = T_INT;
+    else return -1;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "offsets=[", 9) != 0) return -1;
+    p += 9;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p == ']') return -1;
+    for (;;) {
+        if (chain->n >= CHAIN_MAX) return -1;
+        const char *start = p;
+        while (isxdigit((unsigned char)*p) || *p == 'x' || *p == 'X') p++;
+        if (p == start || (size_t)(p - start) >= sizeof value) return -1;
+        memcpy(value, start, (size_t)(p - start));
+        value[p - start] = 0;
+        errno = 0;
+        unsigned long long offset = strtoull(value, &ep, 0);
+        if (errno || *ep) return -1;
+        chain->offs[chain->n++] = (uint64_t)offset;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == ']') { p++; break; }
+        if (*p++ != ',') return -1;
+        while (isspace((unsigned char)*p)) p++;
+    }
+    while (isspace((unsigned char)*p)) p++;
+    if (*p) return -1;
+    chain->rva = (uint64_t)rva;
+    snprintf(set->module, sizeof set->module, "%s", module);
+    return 0;
+}
+
+static int chain_text_format(const Chain *chain, const ChainSet *set, char *buf, size_t len)
+{
+    size_t used = 0;
+    int n = snprintf(buf, len, "cheat-tool-chain:v1 module=\"%s\" type=%s rva=0x%llx offsets=[",
+                     set->module, set->type == T_INT ? "int" : "float",
+                     (unsigned long long)chain->rva);
+    if (n < 0 || (size_t)n >= len) return -1;
+    used = (size_t)n;
+    for (int i = 0; i < chain->n; i++) {
+        n = snprintf(buf + used, len - used, "%s0x%llx", i ? "," : "",
+                     (unsigned long long)chain->offs[i]);
+        if (n < 0 || (size_t)n >= len - used) return -1;
+        used += (size_t)n;
+    }
+    n = snprintf(buf + used, len - used, "]");
+    return n < 0 || (size_t)n >= len - used ? -1 : 0;
+}
+
 static int chain_id_cmp(const void *A, const void *B)
 {
     const Chain *a = A, *b = B;
@@ -1857,6 +1951,8 @@ static void entries_free(WatchEntry *e, int n)
     free(e);
 }
 
+static int entries_parse_file(const char *path, WatchEntry **out, int *outn);
+
 static int entries_load(WatchEntry **out, int *outn)
 {
     *out = NULL;
@@ -1911,12 +2007,25 @@ static int entries_load(WatchEntry **out, int *outn)
             return 0;
         }
     }
+    return entries_parse_file(path, out, outn);
+}
+
+/* read one watches.json into entries; caller frees with entries_free */
+static int entries_parse_file(const char *path, WatchEntry **out, int *outn)
+{
+    *out = NULL;
+    *outn = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "error: open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (sz < 0 || sz > (16 << 20)) {
         fclose(f);
-        fprintf(stderr, "error: watches.json too large\n");
+        fprintf(stderr, "error: %s too large\n", path);
         return -1;
     }
     char *buf = malloc((size_t)sz + 1);
@@ -1931,7 +2040,7 @@ static int entries_load(WatchEntry **out, int *outn)
     free(buf);
     if (!root || root->t != JOBJ) {
         json_free(root);
-        fprintf(stderr, "error: bad %s\n", watches_path());
+        fprintf(stderr, "error: bad %s\n", path);
         return -1;
     }
     int cap = 0, n = 0;
@@ -1943,6 +2052,12 @@ static int entries_load(WatchEntry **out, int *outn)
         JVal *w = root->items[i];
         if (!w || w->t != JOBJ)
             continue;
+        if (strlen(key) >= 24) {
+            entries_free(arr, n);
+            json_free(root);
+            fprintf(stderr, "error: watch name too long: %.40s\n", key);
+            return -1;
+        }
         if (n == cap) {
             int nc = cap ? cap * 2 : 8;
             WatchEntry *na = realloc(arr, (size_t)nc * sizeof *na);
@@ -2664,6 +2779,171 @@ static void chain_remove(const char *name, int rm)
     entries_free(arr, n);
 }
 
+static void cmd_chain_export_text(int argc, char **argv)
+{
+    if (argc < 1) { fprintf(stderr, "error: chain export-text <watch> [--index K]\n"); exit(1); }
+    const char *name = argv[0];
+    int index = -1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--index") == 0 && i + 1 < argc) index = atoi(argv[++i]);
+        else { fprintf(stderr, "error: chain export-text <watch> [--index K]\n"); exit(1); }
+    }
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0) exit(1);
+    WatchEntry *e = NULL;
+    for (int i = 0; i < n; i++) if (strcmp(arr[i].name, name) == 0) { e = &arr[i]; break; }
+    if (!e || !e->has_chain || !e->cs.n) {
+        fprintf(stderr, "error: no chain for watch '%s'\\n", name);
+        entries_free(arr, n); exit(1);
+    }
+    if (index < 0) {
+        if (e->cs.n != 1) {
+            fprintf(stderr, "error: watch has %u chains; specify --index\\n", e->cs.n);
+            entries_free(arr, n); exit(1);
+        }
+        index = 0;
+    }
+    if ((uint32_t)index >= e->cs.n) {
+        fprintf(stderr, "error: chain index out of range\\n"); entries_free(arr, n); exit(1);
+    }
+    char line[4096];
+    int bad_module = 0;
+    for (const unsigned char *m = (const unsigned char *)e->cs.module; *m; m++)
+        if (*m == '"' || *m == '\\' || *m < 0x20) bad_module = 1;
+    if (bad_module || chain_text_format(&e->cs.c[index], &e->cs, line, sizeof line) != 0) {
+        fprintf(stderr, "error: chain cannot be represented as share text\\n");
+        entries_free(arr, n); exit(1);
+    }
+    puts(line);
+    entries_free(arr, n);
+}
+
+static void cmd_chain_import_text(int argc, char **argv)
+{
+    const char *name = NULL, *text = NULL;
+    int replace = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--replace") == 0) replace = 1;
+        else if (!name) name = argv[i];
+        else if (!text) text = argv[i];
+        else {
+            fprintf(stderr, "error: chain import-text <watch> <chain-line> [--replace]\n");
+            exit(1);
+        }
+    }
+    if (!name || !text || !name[0] || strlen(name) >= sizeof ((WatchEntry *)0)->name) {
+        fprintf(stderr, "error: chain import-text <watch> <chain-line> [--replace]\n");
+        exit(1);
+    }
+    Chain chain;
+    ChainSet cs;
+    if (chain_text_parse(text, &chain, &cs) != 0) {
+        fprintf(stderr, "error: invalid chain text\\n");
+        exit(1);
+    }
+    WatchEntry *arr = NULL;
+    int n = 0;
+    if (entries_load(&arr, &n) != 0) exit(1);
+    int idx = -1;
+    for (int i = 0; i < n; i++) if (strcmp(arr[i].name, name) == 0) { idx = i; break; }
+    if (idx >= 0 && !replace) {
+        fprintf(stderr, "error: watch '%s' already exists (use --replace)\\n", name);
+        entries_free(arr, n);
+        exit(1);
+    }
+    if (idx < 0) {
+        WatchEntry *next = realloc(arr, (size_t)(n + 1) * sizeof *next);
+        if (!next) { entries_free(arr, n); exit(1); }
+        arr = next;
+        idx = n++;
+        memset(&arr[idx], 0, sizeof arr[idx]);
+        snprintf(arr[idx].name, sizeof arr[idx].name, "%s", name);
+        arr[idx].type = cs.type;
+    } else {
+        free(arr[idx].cs.c);
+        arr[idx].has_lockval = 0;
+        arr[idx].lock_on = 0;
+    }
+    cs.c = malloc(sizeof chain);
+    if (!cs.c) { entries_free(arr, n); exit(1); }
+    cs.c[0] = chain;
+    cs.n = cs.cap = 1;
+    arr[idx].type = cs.type;
+    arr[idx].has_chain = 1;
+    arr[idx].cs = cs;
+    if (entries_save(arr, n) != 0) { entries_free(arr, n); exit(1); }
+    printf("imported chain for '%s' into %s\\n", name, watches_path());
+    entries_free(arr, n);
+}
+
+static void cmd_chain_import_json(int argc, char **argv)
+{
+    const char *path = NULL;
+    int replace = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--replace") == 0)
+            replace = 1;
+        else if (!path && argv[i][0] != '-')
+            path = argv[i];
+        else {
+            fprintf(stderr, "error: chain import <file> [--replace]\n");
+            exit(1);
+        }
+    }
+    if (!path) {
+        fprintf(stderr, "error: chain import <file> [--replace]\n");
+        exit(1);
+    }
+    WatchEntry *src = NULL, *dst = NULL;
+    int ns = 0, nd = 0;
+    if (entries_parse_file(path, &src, &ns) != 0)
+        exit(1);
+    if (entries_load(&dst, &nd) != 0)
+        exit(1);
+    int added = 0, replaced = 0, skipped = 0;
+    for (int i = 0; i < ns; i++) {
+        int found = -1;
+        for (int j = 0; j < nd; j++)
+            if (strcmp(dst[j].name, src[i].name) == 0) { found = j; break; }
+        if (found >= 0 && !replace) {
+            skipped++;
+            continue;
+        }
+        WatchEntry *e;
+        if (found >= 0) {
+            free(dst[found].cs.c);
+            dst[found] = src[i];
+            memset(&src[i], 0, sizeof src[i]);
+            replaced++;
+            e = &dst[found];
+        } else {
+            WatchEntry *na = realloc(dst, (size_t)(nd + 1) * sizeof *na);
+            if (!na) {
+                fprintf(stderr, "error: out of memory\n");
+                entries_free(src, ns);
+                entries_free(dst, nd);
+                exit(1);
+            }
+            dst = na;
+            dst[nd] = src[i];
+            memset(&src[i], 0, sizeof src[i]);
+            e = &dst[nd++];
+            added++;
+        }
+        (void)e;
+    }
+    if (entries_save(dst, nd) != 0) {
+        entries_free(src, ns);
+        entries_free(dst, nd);
+        exit(1);
+    }
+    printf("imported from %s into %s: %d added, %d replaced, %d skipped\n",
+           path, watches_path(), added, replaced, skipped);
+    entries_free(src, ns);
+    entries_free(dst, nd);
+}
+
 static void cmd_chain_clear(int argc, char **argv)
 {
     if (argc < 1) {
@@ -2686,12 +2966,15 @@ static void cmd_chain(int argc, char **argv)
 {
     if (argc < 1) {
         fprintf(stderr,
-                "usage: chain <scan|list|resolve|verify|load|clear|rm> ...\n"
+                "usage: chain <scan|list|resolve|verify|load|import-text|export-text|import|clear|rm> ...\n"
                 "  scan    <watch> --addr 0xADDR [--type float|int] ...\n"
                 "  list    [<watch>] [--pid P]\n"
                 "  resolve <watch> [--index K] [--value V] [--pid P]\n"
                 "  verify  <watch> --value V [--pid P]\n"
                 "  load    <watch> [--index K] [--value V] [--pid P]\n"
+                "  import-text <watch> <chain-line> [--replace]\n"
+                "  export-text <watch> [--index K]\n"
+                "  import  <file> [--replace]  import watches and chains from a JSON file\n"
                 "  clear   <watch>      remove the watch's chain\n"
                 "  rm      <watch>      remove the watch entirely\n");
         exit(1);
@@ -2707,6 +2990,12 @@ static void cmd_chain(int argc, char **argv)
         cmd_chain_verify(argc - 1, argv + 1);
     else if (strcmp(sub, "load") == 0)
         cmd_chain_load(argc - 1, argv + 1);
+    else if (strcmp(sub, "import") == 0)
+        cmd_chain_import_json(argc - 1, argv + 1);
+    else if (strcmp(sub, "import-text") == 0)
+        cmd_chain_import_text(argc - 1, argv + 1);
+    else if (strcmp(sub, "export-text") == 0)
+        cmd_chain_export_text(argc - 1, argv + 1);
     else if (strcmp(sub, "clear") == 0)
         cmd_chain_clear(argc - 1, argv + 1);
     else if (strcmp(sub, "rm") == 0)
@@ -2898,6 +3187,44 @@ static void watch_start(Watch *w, int mode, double param, double tol)
 }
 
 static void watch_autoload_chain(Watch *w);
+
+static void tui_import_chain(void)
+{
+    if (g_nw >= MAX_WATCH) { set_notice("watch limit reached"); return; }
+    char name[24], text[2048];
+    if (!tui_prompt("watch name: ", name, sizeof name) || !name[0]) return;
+    if (!tui_prompt("paste chain line: ", text, sizeof text) || !text[0]) return;
+    for (int i = 0; i < g_nw; i++)
+        if (strcmp(g_w[i].name, name) == 0) { set_notice("watch name already exists"); return; }
+    Chain chain;
+    ChainSet cs;
+    if (chain_text_parse(text, &chain, &cs) != 0) { set_notice("invalid chain text"); return; }
+    Watch *w = &g_w[g_nw];
+    memset(w, 0, sizeof *w);
+    snprintf(w->name, sizeof w->name, "%s", name);
+    w->s.type = cs.type;
+    w->s.min = g_profile.min;
+    w->s.max = g_profile.max;
+    cs.c = malloc(sizeof chain);
+    if (!cs.c) { set_notice("out of memory"); return; }
+    cs.c[0] = chain;
+    cs.n = cs.cap = 1;
+    w->cs = cs;
+    w->has_cs = 1;
+    snprintf(w->status, sizeof w->status, "imported chain");
+    g_nw++;
+    g_cur = g_nw - 1;
+    watch_bind_chain(w);
+    if (watches_save() != 0) {
+        free(w->cs.c);
+        memset(w, 0, sizeof *w);
+        g_nw--;
+        g_cur = g_nw ? g_nw - 1 : 0;
+        set_notice("chain import save failed");
+        return;
+    }
+    set_notice("chain imported");
+}
 
 static void tui_add_watch(void)
 {
@@ -3375,12 +3702,13 @@ static void tui_chains(Watch *w)
         erase();
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
-        (void)cols;
         attron(A_BOLD);
         mvprintw(0, 0, "chains: %s (%u candidate%s, ranked)", w->name, n,
                  n == 1 ? "" : "s");
         attroff(A_BOLD);
-        int listrows = rows - 3;
+        int share_label = rows - 4;
+        int share_row = rows - 3;
+        int listrows = rows - 6;
         if (listrows < 1)
             listrows = 1;
         if (sel < top)
@@ -3402,7 +3730,29 @@ static void tui_chains(Watch *w)
             if (idx == sel)
                 mvchgat(2 + i, 0, -1, A_REVERSE, 0, NULL);
         }
-        mvprintw(rows - 1, 0, "j/k move  PgUp/PgDn  Enter=bind selected  q=back");
+        if (rows >= 6) {
+            char shared[4096];
+            attron(A_BOLD);
+            mvprintw(share_label, 0, "Share text (selected chain):");
+            attroff(A_BOLD);
+            if (chain_text_format(&w->cs.c[sel], &w->cs, shared, sizeof shared) == 0) {
+                int width = cols > 0 ? cols : 1;
+                size_t len = strlen(shared);
+                size_t start = 0;
+                while (start < len && share_row < rows - 1) {
+                    char chunk[1024];
+                    size_t count = len - start < (size_t)width ? len - start : (size_t)width;
+                    if (count >= sizeof chunk) count = sizeof chunk - 1;
+                    memcpy(chunk, shared + start, count);
+                    chunk[count] = 0;
+                    mvaddnstr(share_row++, 0, chunk, (int)count);
+                    start += count;
+                }
+            } else {
+                mvprintw(share_row, 0, "[chain text unavailable]");
+            }
+        }
+        mvprintw(rows - 1, 0, "j/k select  PgUp/PgDn  Enter=bind selected  q=back");
         refresh();
         int ch = getch();
         if (ch == ERR)
@@ -3576,7 +3926,7 @@ static void tui_draw(void)
     if (g_nw == 0 && datarows > 0)
         mvprintw(4, 2, "(press 'a' to add a watch)");
     tui_hline(rows - 5, innerw, "╰", "╯");
-    mvprintw(rows - 4, 0, "addr : a add  x del  f first  d/i dec/inc  c/u changed/unchanged  e eq  Enter cand  r reset");
+    mvprintw(rows - 4, 0, "addr : a add  I import chain  x del  f first  d/i dec/inc  c/u changed/unchanged  e eq  Enter cand  r reset");
     mvprintw(rows - 3, 0, "value: v lockval  s once  l hold");
     mvprintw(rows - 2, 0, "chain: C scan/intersect  V verify  L list  G load/bind");
     mvprintw(rows - 1, 0, "misc : j/k move  p pid  q quit");
@@ -3613,6 +3963,9 @@ static void tui_handle(int ch)
         break;
     case 'a':
         tui_add_watch();
+        break;
+    case 'I':
+        tui_import_chain();
         break;
     case 'f':
         if (g_nw)
@@ -3786,6 +4139,9 @@ static void usage(const char *prog)
     printf("  chain resolve <watch> [--index K] [--value V] [--pid P]   resolve a chain\n");
     printf("  chain verify <watch> --value V [--pid P]        keep chains whose value == V\n");
     printf("  chain load   <watch> [--index K] [--value V]    resolve and load as current target\n");
+    printf("  chain import-text <watch> <chain-line> [--replace] import one shared chain line\n");
+    printf("  chain export-text <watch> [--index K]          print one shareable chain line\n");
+    printf("  chain import <file> [--replace]            import watches and chains from a JSON file\n");
     printf("  chain clear  <watch>      remove the watch's chain\n");
     printf("  chain rm     <watch>      remove the watch entirely\n");
     printf("  watches are stored in %s\n", watches_path());
